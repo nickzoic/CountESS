@@ -45,7 +45,7 @@ class TestWildTypeModule(unittest.TestCase):
         cfg = make_cfg("AAAAAA", coding=False)
         wt = WildTypeSequence("Test")
         wt.configure(cfg)
-        self.assertEquals(wt.protein_seq, None)
+        self.assertEqual(wt.protein_seq, None)
 
     def test_is_coding(self):
         cfg = make_cfg("AAAAAA", coding=True)
@@ -124,59 +124,59 @@ class TestWildTypeModule(unittest.TestCase):
         cfg = make_cfg("AAAAAA", offset=3, coding=True)
         wt = WildTypeSequence("Test")
         wt.configure(cfg)
-        self.assertEquals(wt.dna_offset, 3)
+        self.assertEqual(wt.dna_offset, 3)
 
     def test_correct_protein_offset_loads_when_coding(self):
         cfg = make_cfg("AAAAAA", offset=6, coding=True)
         wt = WildTypeSequence("Test")
         wt.configure(cfg)
-        self.assertEquals(wt.protein_offset, 2)
+        self.assertEqual(wt.protein_offset, 2)
 
     def test_correct_dna_offset_loads_when_noncoding(self):
         cfg = make_cfg("AAAAAA", offset=3, coding=False)
         wt = WildTypeSequence("Test")
         wt.configure(cfg)
-        self.assertEquals(wt.dna_offset, 3)
+        self.assertEqual(wt.dna_offset, 3)
 
     def test_correct_protein_offset_loads_when_noncoding(self):
         cfg = make_cfg("AAAAAA", offset=3, coding=False)
         wt = WildTypeSequence("Test")
         wt.configure(cfg)
-        self.assertEquals(wt.protein_offset, None)
+        self.assertEqual(wt.protein_offset, None)
 
     def test_serialize_is_matches_input_cfg(self):
         cfg = make_cfg("AAAAAA", offset=0, coding=True)
         wt = WildTypeSequence("Test")
         wt.configure(cfg)
         result_cfg = wt.serialize()
-        self.assertEquals(cfg, result_cfg)
+        self.assertEqual(cfg, result_cfg)
 
         cfg = make_cfg("AAAAAA", offset=0, coding=True)
         wt = WildTypeSequence("Test")
         wt.configure(cfg)
         result_cfg = wt.serialize()
-        self.assertEquals(cfg, result_cfg)
+        self.assertEqual(cfg, result_cfg)
 
     def test_duplicate_is_correct(self):
         cfg = make_cfg("AAAAAA", offset=0, coding=True)
         wt = WildTypeSequence("Test")
         wt.configure(cfg)
         new_wt = wt.duplicate("New")
-        self.assertEquals(wt, new_wt)
+        self.assertEqual(wt, new_wt)
 
     def test_position_tuples_has_correct_offset_coding(self):
         cfg = make_cfg("AAAAAA", offset=6, coding=True)
         wt = WildTypeSequence("Test")
         wt.configure(cfg)
         tuples = wt.position_tuples(protein=True)
-        self.assertEquals(tuples, [(3, "K"), (4, "K")])
+        self.assertEqual(tuples, [(3, "K"), (4, "K")])
 
     def test_position_tuples_has_correct_offset_noncoding(self):
         cfg = make_cfg("AAA", offset=6, coding=False)
         wt = WildTypeSequence("Test")
         wt.configure(cfg)
         tuples = wt.position_tuples(protein=False)
-        self.assertEquals(tuples, [(7, "A"), (8, "A"), (9, "A")])
+        self.assertEqual(tuples, [(7, "A"), (8, "A"), (9, "A")])
 
     def test_throw_error_position_tuples_protein_but_seq_not_coding(self):
         cfg = make_cfg("AAAAAA", offset=6, coding=False)

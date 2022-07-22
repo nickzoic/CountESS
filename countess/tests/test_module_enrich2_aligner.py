@@ -18,7 +18,7 @@ class TestAlignerModule(unittest.TestCase):
             (1, 2, "match", None),
             (2, 3, "match", None),
         ]
-        self.assertEquals(trace, expected_trace)
+        self.assertEqual(trace, expected_trace)
 
     def test_correct_alignment_deletion(self):
         trace = self.aligner.align("ACTG", "ATG")
@@ -28,7 +28,7 @@ class TestAlignerModule(unittest.TestCase):
             (2, 1, "match", None),
             (3, 2, "match", None),
         ]
-        self.assertEquals(trace, expected_trace)
+        self.assertEqual(trace, expected_trace)
 
     def test_correct_alignment_mismatch(self):
         trace = self.aligner.align("ATG", "ACG")
@@ -37,7 +37,7 @@ class TestAlignerModule(unittest.TestCase):
             (1, 1, "mismatch", None),
             (2, 2, "match", None),
         ]
-        self.assertEquals(trace, expected_trace)
+        self.assertEqual(trace, expected_trace)
 
     def test_correct_alignment_exact_match(self):
         trace = self.aligner.align("ATG", "ATG")
@@ -46,7 +46,7 @@ class TestAlignerModule(unittest.TestCase):
             (1, 1, "match", None),
             (2, 2, "match", None),
         ]
-        self.assertEquals(trace, expected_trace)
+        self.assertEqual(trace, expected_trace)
 
     def test_typeerror_non_string_input(self):
         with self.assertRaises(TypeError):
@@ -71,7 +71,7 @@ class TestAlignerModule(unittest.TestCase):
             (1, 1, "match", None),
             (2, 2, "match", None),
         ]
-        self.assertEquals(trace, expected_trace)
+        self.assertEqual(trace, expected_trace)
 
     def test_value_error_missing_gap_penalty(self):
         simple_similarity = {
