@@ -49,16 +49,17 @@ class HdfStore(StoreInterface):
     file_extensions = (".h5",)
     metadata_key = "countESS"
 
-    def __init__(self, path: Union[PathLike, str]) -> None:
+    def __init__(self, path: Union[PathLike, str], mode: 'str' = 'a') -> None:
         super().__init__(path)
 
         if self.path.is_file():
-            with pd.HDFStore(str(self.path)) as store:
+            with pd.HDFStore(str(self.path), mode=mode) as store:
                 # drop the leading "/" from the file keys
                 file_keys = [k[1:] if k.startswith("/") else k for k in store.keys()]
                 self._keys.extend(file_keys)
 
-    def put(self, key: str, value: dd.DataFrame) -> None:
+    def put(self, key: str, value: dd.DataFrame, data_columns) -> None:
+        # XXX TODO data_columns
         """
         Stores a data frame in the HDF file under the given key.
 
