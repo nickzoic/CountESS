@@ -3,7 +3,7 @@
     {
       "fastq": {
         "filters": {},
-        "reads": "enrich2/tests/data/reads/selection/polyA_t0.fq",
+        "reads": "countess/tests/data/reads/selection/polyA_t0.fq",
         "reverse": false
       },
       "name": "polyA_t0",
@@ -21,7 +21,7 @@
     {
       "fastq": {
         "filters": {},
-        "reads": "enrich2/tests/data/reads/selection/polyA_t1.fq",
+        "reads": "countess/tests/data/reads/selection/polyA_t1.fq",
         "reverse": false
       },
       "name": "polyA_t1",
@@ -39,7 +39,7 @@
     {
       "fastq": {
         "filters": {},
-        "reads": "enrich2/tests/data/reads/selection/polyA_t2.fq",
+        "reads": "countess/tests/data/reads/selection/polyA_t2.fq",
         "reverse": false
       },
       "name": "polyA_t2",

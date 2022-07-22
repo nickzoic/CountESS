@@ -7,11 +7,11 @@
           "libraries": [
             {
               "barcodes": {
-                "map file": "enrich2/tests/data/reads/experiment/barcode_map.txt"
+                "map file": "countess/tests/data/reads/experiment/barcode_map.txt"
               }, 
               "fastq": {
                 "filters": {}, 
-                "reads": "enrich2/tests/data/reads/experiment/polyA_t0_s1_c1.fq", 
+                "reads": "countess/tests/data/reads/experiment/polyA_t0_s1_c1.fq", 
                 "reverse": false
               },
               "identifiers": {},
@@ -21,11 +21,11 @@
             }, 
             {
               "barcodes": {
-                "map file": "enrich2/tests/data/reads/experiment/barcode_map.txt"
+                "map file": "countess/tests/data/reads/experiment/barcode_map.txt"
               },
               "fastq": {
                 "filters": {}, 
-                "reads": "enrich2/tests/data/reads/experiment/polyA_t1_s1_c1.fq", 
+                "reads": "countess/tests/data/reads/experiment/polyA_t1_s1_c1.fq", 
                 "reverse": false
               },
               "identifiers": {},
@@ -35,11 +35,11 @@
             }, 
             {
               "barcodes": {
-                "map file": "enrich2/tests/data/reads/experiment/barcode_map.txt"
+                "map file": "countess/tests/data/reads/experiment/barcode_map.txt"
               },
               "fastq": {
                 "filters": {}, 
-                "reads": "enrich2/tests/data/reads/experiment/polyA_t2_s1_c1.fq", 
+                "reads": "countess/tests/data/reads/experiment/polyA_t2_s1_c1.fq", 
                 "reverse": false
               },
               "identifiers": {},
@@ -54,11 +54,11 @@
           "libraries": [
             {
               "barcodes": {
-                "map file": "enrich2/tests/data/reads/experiment/barcode_map.txt"
+                "map file": "countess/tests/data/reads/experiment/barcode_map.txt"
               },
               "fastq": {
                 "filters": {}, 
-                "reads": "enrich2/tests/data/reads/experiment/polyA_t0_s2_c1.fq", 
+                "reads": "countess/tests/data/reads/experiment/polyA_t0_s2_c1.fq", 
                 "reverse": false
               },
               "identifiers": {},
@@ -68,11 +68,11 @@
             }, 
             {
               "barcodes": {
-                "map file": "enrich2/tests/data/reads/experiment/barcode_map.txt"
+                "map file": "countess/tests/data/reads/experiment/barcode_map.txt"
               },
               "fastq": {
                 "filters": {}, 
-                "reads": "enrich2/tests/data/reads/experiment/polyA_t1_s2_c1.fq", 
+                "reads": "countess/tests/data/reads/experiment/polyA_t1_s2_c1.fq", 
                 "reverse": false
               },
               "identifiers": {},
@@ -82,11 +82,11 @@
             }, 
             {
               "barcodes": {
-                "map file": "enrich2/tests/data/reads/experiment/barcode_map.txt"
+                "map file": "countess/tests/data/reads/experiment/barcode_map.txt"
               },
               "fastq": {
                 "filters": {}, 
-                "reads": "enrich2/tests/data/reads/experiment/polyA_t2_s2_c1.fq", 
+                "reads": "countess/tests/data/reads/experiment/polyA_t2_s2_c1.fq", 
                 "reverse": false
               },
               "identifiers": {},
