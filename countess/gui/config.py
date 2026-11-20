@@ -172,6 +172,11 @@ class ParameterWrapper:
         if self.var:
             self.var.trace_add("write", self.value_changed_callback)
 
+        if self._is_typeable():
+            # While the user is typing in a widget update() leaves it alone (see
+            # _is_editing), so when they leave it make it show the real value again.
+            self.entry.bind("<FocusOut>", self._focus_out_callback, add=True)
+
         # XXX hang on, what if it's an array in an array?
         if not parameter.read_only and delete_callback and not self.button:
             self.button = delete_button(tk_parent, command=lambda: delete_callback(self))
@@ -183,6 +188,33 @@ class ParameterWrapper:
         logger.debug("ParameterWrapper.callback(%s)", parameter)
         if self._callback:
             self._callback(parameter)
+
+    def _is_typeable(self) -> bool:
+        """Is this a widget the user can type into?"""
+        if isinstance(self.entry, ttk.Combobox):
+            return str(self.entry["state"]) != "readonly"
+        if isinstance(self.entry, (tk.Entry, tk.Text)):
+            return str(self.entry["state"]) != tk.DISABLED
+        return False
+
+    def _is_editing(self) -> bool:
+        """True if the user is in the middle of typing into this widget.  Whatever
+        is in there then is more up to date than the parameter (which can't hold
+        things like "-" or "1." on the way to "-5" or "1.5", or may have been
+        cleaned up), and overwriting it moves the cursor and eats keystrokes."""
+        if not self._is_typeable():
+            return False
+        try:
+            return self.entry.focus_get() is self.entry
+        except (KeyError, tk.TclError):
+            # focus_get raises KeyError if the focus is in a popdown (eg: a combobox list)
+            return False
+
+    def _focus_out_callback(self, *_):
+        try:
+            self.update()
+        except tk.TclError:
+            pass  # widget is being destroyed
 
     def update(self):
         if self.parameter.hide:
@@ -216,7 +248,8 @@ class ParameterWrapper:
             self.update_subwrappers(self.parameter.params.values(), None)
         elif isinstance(self.parameter, (ChoiceParam, DictChoiceParam)):
             self.entry["values"] = self.parameter.get_values() or [""]
-            self.var.set(self.parameter.value)
+            if not self._is_editing():
+                self.var.set(self.parameter.value)
         elif isinstance(self.parameter, MultiChoiceParam):
             self.var.set(" ".join(self.parameter.choices))
             self.entry.configure(height=len(self.parameter.choices))
@@ -228,11 +261,11 @@ class ParameterWrapper:
         elif isinstance(self.parameter, TextParam):
             if self.parameter.read_only:
                 self.entry["text"] = self.parameter.value
-            else:
+            elif not self._is_editing():
                 self.entry.replace("1.0", tk.END, self.parameter.value or "")
         elif isinstance(self.parameter, FileParam):
             self.entry["text"] = self.parameter.value
-        else:
+        elif not self._is_editing():
             if self.parameter.value is None:
                 self.var.set("")
             else:
