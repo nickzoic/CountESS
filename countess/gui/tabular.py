@@ -6,6 +6,7 @@ from math import ceil, floor, isinf, isnan
 from tkinter import ttk
 from typing import Callable, Optional, Union
 
+import duckdb
 from duckdb import DuckDBPyConnection, DuckDBPyRelation
 
 from countess.gui.widgets import ResizingFrame, copy_to_clipboard, get_icon
@@ -201,7 +202,13 @@ class TabularDataFrame(tk.Frame):
         self.offset = max(0, min(self.length - self.height, int(new_offset)))
 
         table = self.table.order(self.table_order) if self.table_order else self.table
-        rows = table.limit(self.height, offset=self.offset).fetchall()
+        try:
+            rows = table.limit(self.height, offset=self.offset).fetchall()
+        except duckdb.Error:
+            # most likely the table has been dropped because it is being recalculated,
+            # in which case this preview is about to be replaced anyway.
+            logger.debug("TabularDataFrame.refresh table not available")
+            return
 
         for column_num, (column_widget, column_format) in enumerate(zip(self.columns, self.column_formats)):
             column_widget["state"] = tk.NORMAL
@@ -237,26 +244,19 @@ class TabularDataFrame(tk.Frame):
             self.sort_ascending = not descending
         self.sort_by_col = column_num
 
-        # Create an index for whatever column we're sorting by, followed by
-        # all other column names for a stable sort order.
+        # Sort by the chosen column, followed by all other column names
+        # for a stable sort order.
 
         column_name = self.table.columns[column_num]
         escaped_column_names = [
             duckdb_escape_identifier(c) for c in [column_name] + [c for c in self.table.columns if c != column_name]
         ]
 
-        index_identifier = f"{self.table.alias}_{column_num}_idx"
-
-        # XXX I did have some code here which built the index in a separate thread / cursor but it
-        # was mad with race conditions so I've scrapped it for now and the GUI will just have to
-        # awkwardly pause.
-
-        sql = (
-            f"CREATE INDEX IF NOT EXISTS {index_identifier} ON {self.table.alias} ("
-            + ",".join(escaped_column_names)
-            + ")"
-        )
-        self.ddbc.sql(sql)
+        # There used to be a CREATE INDEX here, run on the GUI thread, but DuckDB's
+        # ART indexes aren't used to satisfy ORDER BY ... LIMIT (it was measured at
+        # 0.19s without and 0.18s with, but took over a second to build for a million
+        # rows) and writing to the table's catalog from here races with the worker
+        # thread which is dropping and recreating it.  So just sort on demand.
 
         direction = "ASC" if self.sort_ascending else "DESC"
         self.table_order = ",".join(f"{c} {direction}" for c in escaped_column_names)
@@ -305,6 +305,8 @@ class TabularDataFrame(tk.Frame):
         self.after(10, self._reset_height)
 
     def _reset_height(self):
+        if not self.winfo_exists():
+            return
         # Start with a huge number of rows and let
         # _cw_yscrollcommand trim it back down again.
         # Probably could be more efficient.

@@ -13,6 +13,12 @@ from countess.core.plugins import BasePlugin, DuckdbPlugin, get_plugin_classes
 
 logger = logging.getLogger(__name__)
 
+# The GUI thread edits the graph (adding/removing nodes and links) while the
+# background worker is walking it, so all structural changes and all traversals
+# take this lock.  It is only ever held for the duration of a few set/list
+# operations, never while a query is running.
+GRAPH_LOCK = threading.RLock()
+
 
 class PipelineNodeStatus(Enum):
     DIRTY = 0
@@ -62,6 +68,14 @@ class PipelineNode:
         self.message: Optional[str] = None
         self.finished = threading.Event()
 
+        # `generation` is bumped every time something that affects this node's
+        # result changes (see mark_dirty).  run() remembers the generation it
+        # started with and will only record its result if it is unchanged, so
+        # an edit made while the node is running can never be overwritten by
+        # the (now stale) result.  `_lock` makes the check-and-set atomic.
+        self.generation: int = 0
+        self._lock = threading.RLock()
+
     def set_config(self, key, value, base_dir):
         self.config.append((key, value, base_dir))
 
@@ -76,67 +90,102 @@ class PipelineNode:
 
     def load_config(self):
         assert isinstance(self.plugin, BasePlugin)
-        if self.config:
-            for key, val, base_dir in self.config:
-                try:
-                    self.plugin.set_parameter(key, val, base_dir)
-                    logger.debug("Parameter %s=%s", key, val)
-                except KeyError:
-                    logger.warning("Parameter %s=%s Not Found", key, val)
-                except ValueError:
-                    logger.warning("Parameter %s=%s Not Valid", key, val)
-            self.config = []
+        # Called from both the GUI thread (when a node is first shown) and the
+        # worker thread (first run): make sure the cached config is applied once.
+        with self._lock:
+            if self.config:
+                config, self.config = self.config, []
+                for key, val, base_dir in config:
+                    try:
+                        self.plugin.set_parameter(key, val, base_dir)
+                        logger.debug("Parameter %s=%s", key, val)
+                    except KeyError:
+                        logger.warning("Parameter %s=%s Not Found", key, val)
+                    except ValueError:
+                        logger.warning("Parameter %s=%s Not Valid", key, val)
 
-    def run(self, ddbc, row_limit: Optional[int] = None) -> None:
+    def run(self, ddbc, row_limit: Optional[int] = None) -> bool:
+        """Recalculate this node.  Returns True if the node was left DIRTY
+        and needs to be run again (because it was changed while running, or
+        the query was interrupted), False if it has settled."""
         logger.debug("PipelineNode.run %s", self.uuid)
         if not isinstance(self.plugin, DuckdbPlugin):
-            return
+            return False
         self.load_config()
 
-        # set the node to WORKING now, so that any changes which happen
-        # while we're recalculating will set it DIRTY again and thus
-        # get detected on the next sweep
-        self.status = PipelineNodeStatus.WORKING
-
-        if ddbc and self.table_name:
-            ddbc.sql(f"DROP TABLE IF EXISTS {self.table_name}")
+        # Note the generation and set the node to WORKING atomically.  Any
+        # change which happens from here on bumps the generation (and sets
+        # the node DIRTY), and _settle() will refuse to overwrite that.
+        with self._lock:
+            generation = self.generation
+            self.status = PipelineNodeStatus.WORKING
 
         try:
-            sources = {pn.name: ddbc.table(pn.table_name) for pn in self.parent_nodes if pn.table_name}
+            if ddbc and self.table_name:
+                ddbc.sql(f"DROP TABLE IF EXISTS {self.table_name}")
+
+            sources = {pn.name: ddbc.table(pn.table_name) for pn in list(self.parent_nodes) if pn.table_name}
             self.plugin.prepare_multi(ddbc, sources)
             logger.info("running %s", self.name)
             result = self.plugin.execute_multi(ddbc, sources, row_limit)
-            self.message = ""
-            if result:
-                logger.debug("PipelineNode.run got result %d rows", len(result))
+            if result is not None:
                 result.to_table(self.table_name)
-                self.status = PipelineNodeStatus.RESULT
-            else:
-                logger.debug("PipelineNode.run got no result")
-                self.message = ""
-                self.status = PipelineNodeStatus.ERROR
-        except duckdb.InterruptException:
+                # (the table is already materialized so this count is cheap, whereas
+                # len(result) on the relation would run the whole query again.)
+                rows = len(ddbc.table(self.table_name))
+                logger.debug("PipelineNode.run got result %d rows", rows)
+                if rows:
+                    return self._settle(generation, PipelineNodeStatus.RESULT, "")
+            logger.debug("PipelineNode.run got no result")
+            return self._settle(generation, PipelineNodeStatus.ERROR, "")
+        except (duckdb.InterruptException, duckdb.TransactionException):
+            # Interrupted because we're stale, or lost a race for the catalog
+            # with a reader: either way the right thing to do is try again.
             logger.debug("Query interrupted: retrying")
-            self.message = None
+            return self._settle(generation, None)
         except Exception as exc:  # pylint: disable=broad-exception-caught
             logger.warning("PipelineNode.run %s exception %s", self.uuid, repr(exc))
-            self.message = "\n".join(traceback.format_exception(exc))
-            self.status = PipelineNodeStatus.ERROR
+            return self._settle(generation, PipelineNodeStatus.ERROR, "\n".join(traceback.format_exception(exc)))
 
-    def mark_dirty(self):
-        self.status = PipelineNodeStatus.DIRTY
-        for child_node in self.child_nodes:
-            child_node.mark_dirty()
+    def _settle(self, generation: int, status: Optional[PipelineNodeStatus], message: Optional[str] = None) -> bool:
+        """Record the outcome of a run, unless the node changed while it was running.
+        `status` of None means "retry".  Returns True if the node is DIRTY."""
+        with self._lock:
+            if self.generation != generation:
+                # changed under our feet: the node is already DIRTY and
+                # whatever we calculated (or whatever went wrong) is moot.
+                return True
+            if status is None:
+                self.message = None
+                self.status = PipelineNodeStatus.DIRTY
+                return True
+            self.message = message
+            self.status = status
+            return False
+
+    def mark_dirty(self, _seen: Optional[set] = None):
+        if _seen is None:
+            _seen = set()
+        if self in _seen:
+            return
+        _seen.add(self)
+        with self._lock:
+            self.generation += 1
+            self.status = PipelineNodeStatus.DIRTY
+        for child_node in list(self.child_nodes):
+            child_node.mark_dirty(_seen)
 
     def add_parent(self, parent):
         if (not self.plugin or self.plugin.num_inputs) and (not parent.plugin or parent.plugin.num_outputs):
-            self.parent_nodes.add(parent)
-            parent.child_nodes.add(self)
+            with GRAPH_LOCK:
+                self.parent_nodes.add(parent)
+                parent.child_nodes.add(self)
             self.mark_dirty()
 
     def del_parent(self, parent):
-        self.parent_nodes.discard(parent)
-        parent.child_nodes.discard(self)
+        with GRAPH_LOCK:
+            self.parent_nodes.discard(parent)
+            parent.child_nodes.discard(self)
         self.mark_dirty()
 
     def configure_plugin(self, key, value, base_dir="."):
@@ -145,10 +194,11 @@ class PipelineNode:
 
     def detach(self):
         self.mark_dirty()
-        for parent_node in self.parent_nodes:
-            parent_node.child_nodes.discard(self)
-        for child_node in self.child_nodes:
-            child_node.parent_nodes.discard(self)
+        with GRAPH_LOCK:
+            for parent_node in self.parent_nodes:
+                parent_node.child_nodes.discard(self)
+            for child_node in self.child_nodes:
+                child_node.parent_nodes.discard(self)
 
 
 class PipelineGraph:
@@ -160,17 +210,36 @@ class PipelineGraph:
         self.ddbc.create_function("warning", self.sql_warning)
         self.preview_row_limit = preview_row_limit
 
+        # self.ddbc is for the GUI thread only.  The background worker has a
+        # cursor of its own, which is created here (on the creating thread) rather
+        # than in the worker, so that nothing ever calls self.ddbc.cursor() while
+        # the GUI is using self.ddbc.  The worker is the only thread which
+        # executes queries on it; other threads may only call interrupt() or
+        # query_progress() on it.
+        self.thread_cursor: duckdb.DuckDBPyConnection = self.ddbc.cursor()
+        self.thread_cursor.sql("set enable_progress_bar=true")
+        self.thread_cursor.sql("set enable_progress_bar_print=false")
+
+        # The worker thread runs only while there is work to do: update() asks
+        # for a sweep and starts a worker if there isn't one running.
         self.thread: Optional[threading.Thread] = None
-        self.thread_cursor: Optional[duckdb.DuckDBPyConnection] = None
-        self.thread_stop: bool = False
+        self._state_lock = threading.Lock()
+        self._pending = False  # a sweep has been requested
+        self._worker_running = False
+        self._abort = threading.Event()  # the current sweep is out of date
+        self._quit = False
+        self._current_node: Optional[PipelineNode] = None
 
     def reset(self):
         for node in self.nodes:
-            node.status = PipelineNodeStatus.DIRTY
-        self.start_thread()
+            node.mark_dirty()
+        self.update()
 
     def __del__(self):
-        self.stop_thread()
+        try:
+            self.stop_thread(wait=False)
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
 
     def sql_warning(self, message: str, value: Optional[str]) -> Optional[str]:
         logger.warning(message)
@@ -187,11 +256,17 @@ class PipelineGraph:
 
     def add_node(self, node: PipelineNode):
         self.reset_node_name(node)
-        self.nodes.append(node)
+        with GRAPH_LOCK:
+            self.nodes.append(node)
 
     def del_node(self, node: PipelineNode):
         node.detach()
-        self.nodes.remove(node)
+        self.remove_node(node)
+
+    def remove_node(self, node: PipelineNode):
+        """Remove a node from the graph, without touching its links."""
+        with GRAPH_LOCK:
+            self.nodes.remove(node)
 
     def find_node(self, name: str) -> Optional[PipelineNode]:
         for node in self.nodes:
@@ -200,99 +275,171 @@ class PipelineGraph:
         return None
 
     def traverse_nodes(self) -> Iterable[PipelineNode]:
-        found_nodes = set(node for node in self.nodes if not node.parent_nodes)
-        yield from sorted(found_nodes, key=lambda n: n.uuid)
+        """Nodes in dependency order (parents before children).  The order is
+        worked out all at once, under the lock, so it is safe to iterate over
+        while another thread is editing the graph.  Nodes which can't be
+        ordered (because of a cycle) are left out rather than looping forever."""
+        with GRAPH_LOCK:
+            nodes = list(self.nodes)
+            found_nodes = set(node for node in nodes if not node.parent_nodes)
+            order = sorted(found_nodes, key=lambda n: n.uuid)
 
-        while len(found_nodes) < len(self.nodes):
-            for node in sorted(self.nodes, key=lambda n: n.uuid):
-                if node not in found_nodes and node.parent_nodes.issubset(found_nodes):
-                    yield node
-                    found_nodes.add(node)
+            progress = True
+            while len(found_nodes) < len(nodes) and progress:
+                progress = False
+                for node in sorted(nodes, key=lambda n: n.uuid):
+                    if node not in found_nodes and node.parent_nodes.issubset(found_nodes):
+                        order.append(node)
+                        found_nodes.add(node)
+                        progress = True
+
+        yield from order
 
     def traverse_nodes_backwards(self) -> Iterable[PipelineNode]:
-        found_nodes = set(node for node in self.nodes if not node.child_nodes)
-        yield from found_nodes
+        with GRAPH_LOCK:
+            nodes = list(self.nodes)
+            found_nodes = set(node for node in nodes if not node.child_nodes)
+            order = list(found_nodes)
 
-        while len(found_nodes) < len(self.nodes):
-            for node in self.nodes:
-                if node not in found_nodes and node.child_nodes.issubset(found_nodes):
-                    yield node
-                    found_nodes.add(node)
+            progress = True
+            while len(found_nodes) < len(nodes) and progress:
+                progress = False
+                for node in nodes:
+                    if node not in found_nodes and node.child_nodes.issubset(found_nodes):
+                        order.append(node)
+                        found_nodes.add(node)
+                        progress = True
+
+        yield from order
 
     def run_node(self, node: PipelineNode):
         return node.run(self.ddbc)
 
-    def stop_thread(self):
+    def stop_thread(self, wait: bool = True, timeout: Optional[float] = None):
+        """Ask the worker to stop and (optionally) wait for it to do so.  Only
+        needed when the graph is being thrown away: for ordinary changes call
+        update(), which never blocks."""
         logger.debug("PipelineGraph.stop_thread")
-        self.thread_stop = True
-        if self.thread and self.thread.is_alive():
-            if self.thread_cursor:
-                try:
-                    self.thread_cursor.interrupt()
-                except duckdb.ConnectionException:
-                    pass
-            self.thread.join()
+        with self._state_lock:
+            self._quit = True
+            self._abort.set()
+            thread = self.thread
+        self._interrupt_current(force=True)
+        if wait and thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout)
 
     def start_thread(self):
-        logger.debug("PipelineGraph.start_thread")
-        self.thread_stop = False
-        self.thread = threading.Thread(target=self._thread_target)
-        self.thread.start()
+        """Ensure that a sweep happens.  Equivalent to update()."""
+        self.update()
 
     def update(self):
+        """Something has changed: make sure the dirty nodes get recalculated.
+        This never blocks, so it is safe to call from the GUI thread.  If a
+        sweep is in progress it is abandoned (and an interrupt sent, if the
+        node it is working on is the one which has gone out of date) and a
+        fresh one is started as soon as possible."""
         logger.debug("PipelineGraph.update")
-        self.stop_thread()
-        self.start_thread()
+        with self._state_lock:
+            if self._quit:
+                return
+            self._pending = True
+            self._abort.set()
+            if not self._worker_running:
+                self._worker_running = True
+                self.thread = threading.Thread(target=self._thread_target, name="PipelineGraph", daemon=True)
+                self.thread.start()
+        self._interrupt_current()
+
+    def _interrupt_current(self, force: bool = False):
+        # Interrupting is only an optimization: a node which is changed while
+        # running is discarded anyway (see PipelineNode._settle), but there's
+        # no point waiting for a long query whose result we'll throw away.
+        # Don't kill queries which are still valid though.
+        node = self._current_node
+        if node is not None and (force or node.status == PipelineNodeStatus.DIRTY):
+            try:
+                self.thread_cursor.interrupt()
+            except duckdb.Error:
+                pass
 
     def progress(self) -> bool:
-        assert self.thread_cursor
         still_working = False
+        working = self._worker_running
         for node in self.traverse_nodes():
-            if self.thread and self.thread.is_alive():
-                if node.status == PipelineNodeStatus.DIRTY:
-                    logger.info("%s: 0%%", node.name)
-                    still_working = True
-                elif node.status == PipelineNodeStatus.WORKING:
-                    if isinstance(node.plugin, DuckdbPlugin):
+            if working and node.status == PipelineNodeStatus.DIRTY:
+                logger.info("%s: 0%%", node.name)
+                still_working = True
+            elif working and node.status == PipelineNodeStatus.WORKING:
+                qp = 0
+                if isinstance(node.plugin, DuckdbPlugin):
+                    try:
                         qp = node.plugin.query_progress(self.thread_cursor)
-                        if qp > 0:
-                            logger.info("%s: %d%%", node.name, qp)
-                        else:
-                            logger.info("%s: 0/0", node.name)
-                    else:
-                        logger.info("%s: 0/0", node.name)
-                    still_working = True
+                    except duckdb.Error:
+                        qp = 0
+                if qp > 0:
+                    logger.info("%s: %d%%", node.name, qp)
                 else:
-                    logger.info("%s: 100%%", node.name)
+                    logger.info("%s: 0/0", node.name)
+                still_working = True
             else:
                 logger.info("%s: 100%%", node.name)
 
         return still_working
 
     def _thread_target(self):
-        """Check for dirty nodes and update their results."""
+        """Worker: sweep for dirty nodes and update their results, until
+        there's nothing left to do."""
         logger.debug("Pipelinegraph._thread_target starting")
+        while True:
+            with self._state_lock:
+                if self._quit or not self._pending:
+                    self._worker_running = False
+                    logger.debug("Pipelinegraph._thread_target finished")
+                    return
+                self._pending = False
+                self._abort.clear()
 
-        # thread_cursor needs to be exposed to the main thread so that the main
-        # thread can call self.thread_cursor.interrupt() in case of long running
-        # slow queries.
-        self.thread_cursor = self.ddbc.cursor()
-        self.thread_cursor.sql("set enable_progress_bar=true")
-        self.thread_cursor.sql("set enable_progress_bar_print=false")
+            try:
+                retry = self._sweep()
+            except Exception:  # pylint: disable=broad-exception-caught
+                logger.exception("Pipelinegraph._thread_target sweep failed")
+                retry = False
+
+            if retry:
+                # something was interrupted or lost a race: back off briefly and go again.
+                self._abort.wait(0.1)
+                with self._state_lock:
+                    self._pending = True
+
+    def _sweep(self) -> bool:
+        """One pass over the graph, recalculating dirty nodes.  Returns True if
+        any node needs another go."""
+        retry = False
+        blocked: set[PipelineNode] = set()
         try:
             for node in self.traverse_nodes():
-                if self.thread_stop:
-                    logger.debug("Pipelinegraph._thread_target stopped")
-                if node.status == PipelineNodeStatus.DIRTY:
-                    logger.debug("Pipelinegraph._thread_target recalculating %s", node.uuid)
-                    node.run(self.thread_cursor, self.preview_row_limit)
-                else:
-                    logger.debug("Pipelinegraph._thread_target %s is clean", node.uuid)
-            logger.debug("Pipelinegraph._thread_target finished")
+                if self._quit or self._abort.is_set():
+                    logger.debug("Pipelinegraph._sweep abandoned")
+                    return False
+                if node.status != PipelineNodeStatus.DIRTY:
+                    logger.debug("Pipelinegraph._sweep %s is clean", node.uuid)
+                    continue
+                if any(p in blocked for p in list(node.parent_nodes)):
+                    # an input isn't ready yet, we'll get to this on the next pass.
+                    blocked.add(node)
+                    continue
+                logger.debug("Pipelinegraph._sweep recalculating %s", node.uuid)
+                self._current_node = node
+                try:
+                    if node.run(self.thread_cursor, self.preview_row_limit):
+                        blocked.add(node)
+                        retry = True
+                finally:
+                    self._current_node = None
         except duckdb.InterruptException:
-            logger.debug("Pipelinegraph._thread_target interrupted")
-        finally:
-            self.thread_cursor.close()
+            logger.debug("Pipelinegraph._sweep interrupted")
+            retry = True
+        return retry
 
     def simplify(self):
         for node in self.traverse_nodes():

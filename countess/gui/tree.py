@@ -494,10 +494,13 @@ class GraphWrapper:
                 for parent_node in parent_nodes:
                     self.add_parent(parent_node, child_node)
         if not event.state & TkEventState.CONTROL:
-            self.graph.nodes.remove(node)
+            self.graph.remove_node(node)
             del self.labels[node]
             del self.lines[node]
             event.widget.destroy()
+
+        # links have changed, so something needs recalculating
+        self.graph.update()
 
         if len(self.graph.nodes) == 0:
             new_node = self.add_new_node(select=True)
@@ -517,7 +520,9 @@ class GraphWrapper:
     def add_node(self, new_node, select: bool = True):
         self.graph.add_node(new_node)
         self.labels[new_node] = self.label_for_node(new_node)
-        self.labels[new_node].update()
+        # (update_idletasks, not update: we only need the geometry, not for
+        # every other pending event handler to run in the middle of this one)
+        self.labels[new_node].update_idletasks()
         self.lines[new_node] = {}
         if select:
             self.highlight_node(new_node)

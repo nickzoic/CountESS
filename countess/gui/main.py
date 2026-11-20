@@ -19,6 +19,7 @@ from collections.abc import Callable
 from tkinter import messagebox, ttk
 from typing import Optional, Union
 
+import duckdb
 import psutil
 
 from countess import VERSION
@@ -112,6 +113,17 @@ class ConfiguratorWrapper:
         self.ddbc = ddbc
         self.change_callback = change_callback
 
+        # Every deferred callback this wrapper schedules is tracked so that
+        # destroy() can cancel them: otherwise they fire later against widgets
+        # which no longer exist.  There is also at most one pending timer for
+        # each of the "config changed" debounce, the "wait for result" poll and
+        # the "wait for preview" poll, so repeated changes don't multiply them.
+        self._destroyed = False
+        self._after_ids: set[str] = set()
+        self._change_after_id: Optional[str] = None
+        self._poll_after_id: Optional[str] = None
+        self._preview_after_id: Optional[str] = None
+
         self.frame = ResizingFrame(tk_parent, orientation=ResizingFrame.Orientation.VERTICAL, bg="darkgrey")
         self.subframe = self.frame.add_frame()
         self.subframe.columnconfigure(0, weight=1)
@@ -127,8 +139,28 @@ class ConfiguratorWrapper:
         self.label.grid(sticky=tk.EW, row=1, padx=10, pady=5)
         self.label.bind("<Configure>", self.on_label_configure)
 
-        self.frame.after(50, self.show_config_subframe)
-        self.frame.after(500, self.replace_preview_subframe)
+        self._after(50, self.show_config_subframe)
+        self._after(500, self.replace_preview_subframe)
+
+    def _after(self, delay_ms: int, func, *args) -> str:
+        """Like frame.after() but cancelled by destroy()"""
+
+        def _run():
+            self._after_ids.discard(after_id)
+            if not self._destroyed:
+                func(*args)
+
+        after_id = self.frame.after(delay_ms, _run)
+        self._after_ids.add(after_id)
+        return after_id
+
+    def _cancel(self, after_id: Optional[str]) -> None:
+        if after_id:
+            self._after_ids.discard(after_id)
+            try:
+                self.frame.after_cancel(after_id)
+            except tk.TclError:
+                pass
 
     def show_config_subframe(self):
         if self.config_subframe:
@@ -160,7 +192,7 @@ class ConfiguratorWrapper:
             )
             if self.node.plugin.link:
                 info_button(self.frame, command=self.on_info_button_press).place(anchor=tk.NE, relx=1, y=50)
-            self.frame.after(100, self.show_configurator)
+            self._after(100, self.show_configurator)
 
         else:
             has_parents = len(self.node.parent_nodes) > 0
@@ -213,39 +245,57 @@ class ConfiguratorWrapper:
     def show_preview_subframe(self):
         logger.debug("ConfiguratorWrapper.show_preview_subframe %s %s", self.node.name, self.node.uuid)
 
-        if not self.node.plugin or not self.node.plugin.show_preview:
+        # only ever one pending attempt at a time
+        self._cancel(self._preview_after_id)
+        self._preview_after_id = None
+
+        if self.preview_subframe or not self.node.plugin or not self.node.plugin.show_preview:
             return
 
         if self.node.status == PipelineNodeStatus.ERROR:
             logger.debug("ConfiguratorWrapper.show_preview_subframe %s", self.node.message)
             self.preview_subframe = tk.Frame(self.frame)
             text = tk.Text(self.preview_subframe)
-            text.insert("1.0", self.node.message)
+            text.insert("1.0", self.node.message or "")
             text["state"] = "disabled"
             text.grid(sticky=tk.NSEW)
             self.frame.add_child(self.preview_subframe)
 
         elif self.node.status == PipelineNodeStatus.RESULT:
             logger.debug("ConfiguratorWrapper.show_preview_subframe %s", self.node.table_name)
-            self.preview_subframe = TabularDataFrame(self.frame, cursor="arrow")
-            self.preview_subframe.set_table(self.ddbc, self.ddbc.table(self.node.table_name))
-            self.preview_subframe.set_sort_order(self.node.sort_column or 0, self.node.sort_descending)
-            self.preview_subframe.set_callback(self.preview_changed_callback)
+            preview = TabularDataFrame(self.frame, cursor="arrow")
+            try:
+                preview.set_table(self.ddbc, self.ddbc.table(self.node.table_name))
+                preview.set_sort_order(self.node.sort_column or 0, self.node.sort_descending)
+            except duckdb.Error:
+                # the worker dropped the table between us checking the status and
+                # reading it: the node is about to be DIRTY, so try again shortly.
+                logger.debug("ConfiguratorWrapper.show_preview_subframe table not available, retrying")
+                preview.destroy()
+                self._preview_after_id = self._after(100, self.show_preview_subframe)
+                return
+            preview.set_callback(self.preview_changed_callback)
+            self.preview_subframe = preview
             self.frame.add_child(self.preview_subframe)
 
         else:
-            self.frame.after(100, self.show_preview_subframe)
+            self._preview_after_id = self._after(100, self.show_preview_subframe)
 
     def hide_preview_subframe(self):
         logger.debug("ConfiguratorWrapper.hide_preview_subframe %s %s", self.node.name, self.node.uuid)
+        self._cancel(self._preview_after_id)
+        self._preview_after_id = None
         if self.preview_subframe:
             self.frame.remove_child(self.preview_subframe).destroy()
+            self.preview_subframe = None
 
     def replace_preview_subframe(self):
         self.hide_preview_subframe()
         self.show_preview_subframe()
 
     def notify(self):
+        self._cancel(self._poll_after_id)
+        self._poll_after_id = None
         self.config_change_poll_callback()
 
     def preview_changed_callback(self, offset: int, sort_col: int, sort_desc: bool) -> None:
@@ -262,32 +312,51 @@ class ConfiguratorWrapper:
         self.notes_widget.edit_modified(False)
 
     def config_change_callback(self, *_):
-        """Called immediately if a change to config has occurred."""
+        """Called immediately if a change to config has occurred.  Changes tend
+        to come in bursts (every keystroke in an entry field is one) so we wait
+        for things to settle down before disturbing the pipeline."""
         logger.debug("config_change_callback %s", self.node.name)
-        self.frame.after(10, self.change_callback, self.node, True)
-        self.frame.after(250, self.config_change_poll_callback)
+        self._cancel(self._change_after_id)
+        self._change_after_id = self._after(200, self._config_change_fire)
+
+    def _config_change_fire(self):
+        self._change_after_id = None
+        self.change_callback(self.node, True)
+        self._start_poll()
+
+    def _start_poll(self):
+        if self._poll_after_id is None:
+            self._poll_after_id = self._after(250, self.config_change_poll_callback)
 
     def config_change_poll_callback(self):
         logger.debug("ConfiguratorWrapper.config_change_poll_callback")
-        if self.node.status in (PipelineNodeStatus.DIRTY, PipelineNodeStatus.WORKING):
-            self.frame.after(250, self.config_change_poll_callback)
+        self._poll_after_id = None
+        if self._change_after_id is not None or self.node.status in (
+            PipelineNodeStatus.DIRTY,
+            PipelineNodeStatus.WORKING,
+        ):
+            self._start_poll()
         else:
             self.config_change_poll_done()
 
     def config_change_poll_done(self):
         logger.debug("ConfiguratorWrapper.config_change_poll_done")
-        if self.config_scrollbar:
+        self.replace_preview_subframe()
+        if self.config_scrollbar and self.configurator:
             pos1, pos2 = self.config_scrollbar.get()
-            self.replace_preview_subframe()
             self.configurator.update()
-            self.frame.update()
+            # update_idletasks (as opposed to update) lays out the widgets without
+            # running arbitrary other event handlers in the middle of this one.
+            self.frame.update_idletasks()
             self.config_canvas.yview_moveto(pos1)
             self.config_scrollbar.set(pos1, pos2)
         else:
-            self.replace_preview_subframe()
-            self.frame.update()
+            self.frame.update_idletasks()
 
     def destroy(self):
+        self._destroyed = True
+        for after_id in list(self._after_ids):
+            self._cancel(after_id)
         self.frame.destroy()
 
 
@@ -410,6 +479,7 @@ class MainWindow:
     left and the ConfiguratorWrapper either beside it or under it depending on
     the window dimenstions"""
 
+    graph = None
     graph_wrapper = None
     preview_frame = None
     config_wrapper = None
@@ -491,6 +561,34 @@ class MainWindow:
         else:
             self.frame.after(100, self.logger_subframe_hide_task)
 
+    def _discard_graph(self):
+        """Get rid of the current graph, and everything in the GUI that refers to it."""
+        if self.graph_wrapper:
+            self.graph_wrapper.destroy()
+            self.graph_wrapper = None
+
+        # Replace whatever is showing in the configuration pane with the splash,
+        # then throw away the cached wrappers: they hold on to nodes (and the
+        # database connection) of the old graph and have timers still running.
+        splash = SplashWrapper(self.main_subframe)
+        old_wrapper = self.config_wrapper
+        if old_wrapper:
+            self.main_subframe.replace_child(old_wrapper.frame, splash.frame)
+        else:
+            self.main_subframe.add_child(splash.frame, weight=4)
+        self.config_wrapper = splash
+        for wrapper in list(self.config_wrapper_cache.values()):
+            wrapper.destroy()
+        if old_wrapper and old_wrapper not in self.config_wrapper_cache.values():
+            old_wrapper.destroy()
+        self.config_wrapper_cache.clear()
+
+        # Tell the old graph's worker to stop but don't wait for it, it'll
+        # notice (and interrupt any running query) in its own time.
+        if self.graph:
+            self.graph.stop_thread(wait=False)
+            self.graph = None
+
     def config_new(self):
         if self.config_changed:
             if not messagebox.askokcancel("Clear Config", "Clear unsaved config?"):
@@ -498,8 +596,7 @@ class MainWindow:
         self.config_changed = False
         self.config_filename = None
         self.update_title()
-        if self.graph_wrapper:
-            self.graph_wrapper.destroy()
+        self._discard_graph()
         self.graph = PipelineGraph(preview_row_limit=preview_row_limit)
         self.graph_wrapper = GraphWrapper(self.tree_canvas, self.graph, self.node_select)
         self.graph_wrapper.add_new_node(select=False)
@@ -513,8 +610,7 @@ class MainWindow:
         self.config_changed = False
         self.update_title()
 
-        if self.graph_wrapper:
-            self.graph_wrapper.destroy()
+        self._discard_graph()
         self.graph = read_config([filename])
         self.graph.preview_row_limit = preview_row_limit
         self.graph.reset()
@@ -579,6 +675,10 @@ class MainWindow:
 
     def program_exit(self):
         if not self.config_changed or messagebox.askokcancel("Exit", "Exit CountESS without saving config?"):
+            if self.graph:
+                # give the worker a moment to wind down so DuckDB isn't torn
+                # down underneath it, but don't hang if it won't.
+                self.graph.stop_thread(timeout=5)
             self.tk_parent.quit()
 
     def node_select(self, node):
