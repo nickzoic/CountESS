@@ -1,10 +1,13 @@
 import ast
 import io
+import json
 import logging
 import os.path
 import re
 from configparser import ConfigParser
+from typing import Any
 
+from countess import VERSION
 from countess.core.pipeline import PipelineGraph, PipelineNode
 from countess.core.plugins import load_plugin
 
@@ -55,7 +58,13 @@ def read_config_dict(name: str, base_dir: str, config_dict: dict) -> PipelineNod
 def read_config(
     filenames: list[str],
 ) -> PipelineGraph:
-    """Reads `filenames` and returns a PipelineGraph"""
+    """Reads `filenames` and returns a PipelineGraph.  A file with a name ending
+    in .json is read as JSON (see read_json_config), anything else as an .ini file."""
+
+    if any(is_json_filename(f) for f in filenames):
+        if len(filenames) != 1:
+            raise ValueError("A JSON config file can't be combined with other config files")
+        return read_json_config(filenames[0])
 
     cp = ConfigParser(interpolation=None)
     for filename in filenames:
@@ -94,12 +103,158 @@ def graph_to_config(pipeline_graph: PipelineGraph, base_dir: str = ".") -> Confi
 
 
 def write_config(pipeline_graph: PipelineGraph, filename: str):
-    """Write `pipeline_graph`'s configuration out to `filename`"""
+    """Write `pipeline_graph`'s configuration out to `filename`, as JSON if
+    its name ends in .json (see write_json_config) or as an .ini file otherwise."""
+    if is_json_filename(filename):
+        return write_json_config(pipeline_graph, filename)
+
     base_dir = os.path.dirname(filename)
     cp = graph_to_config(pipeline_graph, base_dir)
 
     with open(filename, "w", encoding="utf-8") as fh:
         cp.write(fh)
+
+
+def is_json_filename(filename: str) -> bool:
+    return str(filename).lower().endswith(".json")
+
+
+# The JSON format is a single object:
+#
+#   {
+#     "format": "countess-config",
+#     "version": 1,
+#     "countess_version": "0.1.28",
+#     "nodes": [
+#       {
+#         "name": "Load",                      (unique)
+#         "uuid": "...",
+#         "plugin": {"module": ..., "class": ..., "version": ..., "hash": ...},
+#         "parameters": { ... plugin.get_json_data() ... },
+#         "parents": ["name of another node", ...],
+#         "position": [0.25, 0.5],
+#         "sort": {"column": 0, "descending": false},
+#         "notes": "..."
+#       }, ...
+#     ]
+#   }
+#
+# Everything but "name" is optional, and a node with no "plugin" is one which
+# hasn't been set up yet.  Filenames in "parameters" are relative to the directory
+# the config file is in, as they are in .ini files.
+
+JSON_FORMAT = "countess-config"
+JSON_VERSION = 1
+
+
+def node_to_json(node: PipelineNode, base_dir: str = ".") -> dict[str, Any]:
+    data: dict[str, Any] = {"name": node.name, "uuid": node.uuid}
+    if node.plugin:
+        node.load_config()
+        data["plugin"] = {
+            "module": node.plugin.__module__,
+            "class": node.plugin.__class__.__name__,
+            "version": node.plugin.version,
+            "hash": node.plugin.hash(),
+        }
+        data["sort"] = {"column": node.sort_column, "descending": bool(node.sort_descending)}
+    if node.position:
+        data["position"] = [round(node.position[0], 4), round(node.position[1], 4)]
+    if node.notes:
+        data["notes"] = node.notes
+    if node.parent_nodes:
+        # sorted, so that the same graph always makes the same file
+        data["parents"] = sorted(parent.name for parent in node.parent_nodes)
+    if node.plugin:
+        data["parameters"] = node.plugin.get_json_data(base_dir)
+    return data
+
+
+def graph_to_json(pipeline_graph: PipelineGraph, base_dir: str = ".") -> dict[str, Any]:
+    pipeline_graph.reset_node_names()
+    return {
+        "format": JSON_FORMAT,
+        "version": JSON_VERSION,
+        "countess_version": VERSION,
+        "nodes": [node_to_json(node, base_dir) for node in pipeline_graph.traverse_nodes()],
+    }
+
+
+def json_to_graph(data: Any, base_dir: str = ".") -> PipelineGraph:
+    """Make a PipelineGraph from what graph_to_json() makes.  Raises ValueError
+    if `data` isn't a CountESS config.  Problems with the parameters of
+    individual plugins (ones which no longer exist, say) are logged as warnings
+    rather than being fatal, as they are with .ini files."""
+
+    if not isinstance(data, dict) or data.get("format") != JSON_FORMAT:
+        raise ValueError("Not a CountESS JSON config file")
+    version = data.get("version")
+    if not isinstance(version, int) or version > JSON_VERSION:
+        raise ValueError(f"Unsupported CountESS JSON config version {version!r}")
+    node_list = data.get("nodes", [])
+    if not isinstance(node_list, list):
+        raise ValueError('"nodes" should be a list')
+
+    pipeline_graph = PipelineGraph()
+    nodes_by_name: dict[str, PipelineNode] = {}
+
+    for node_data in node_list:
+        if not isinstance(node_data, dict) or not isinstance(node_data.get("name"), str):
+            raise ValueError("Every node needs a name")
+        name = node_data["name"]
+        if name in nodes_by_name:
+            raise ValueError(f"Duplicate node name {name!r}")
+
+        plugin = None
+        if "plugin" in node_data:
+            plugin_data = node_data["plugin"]
+            # XXX check "version" and "hash" and emit warnings, as for .ini files
+            plugin = load_plugin(plugin_data["module"], plugin_data["class"])
+            if plugin and "parameters" in node_data:
+                plugin.set_json_data(node_data["parameters"], base_dir)
+
+        position = node_data.get("position")
+        sort = node_data.get("sort", {})
+        node = PipelineNode(
+            name=name,
+            uuid=node_data.get("uuid"),
+            plugin=plugin,
+            position=(float(position[0]), float(position[1])) if position else None,
+            notes=node_data.get("notes"),
+            sort_column=int(sort.get("column", 0)),
+            sort_descending=bool(sort.get("descending", False)),
+        )
+        pipeline_graph.nodes.append(node)
+        nodes_by_name[name] = node
+
+    # links are made afterwards so that nodes can be in any order.
+    for node_data in node_list:
+        for parent_name in node_data.get("parents", []):
+            try:
+                nodes_by_name[node_data["name"]].add_parent(nodes_by_name[parent_name])
+            except KeyError as exc:
+                raise ValueError(f"Node {node_data['name']!r} has unknown parent {parent_name!r}") from exc
+
+    return pipeline_graph
+
+
+def read_json_config(filename: str) -> PipelineGraph:
+    """Reads the JSON config file `filename` and returns a PipelineGraph"""
+    with open(filename, "r", encoding="utf-8") as fh:
+        try:
+            data = json.load(fh)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{filename} is not valid JSON: {exc}") from exc
+    return json_to_graph(data, os.path.dirname(os.path.abspath(filename)))
+
+
+def write_json_config(pipeline_graph: PipelineGraph, filename: str):
+    """Write `pipeline_graph`'s configuration out to `filename` as JSON"""
+    data = graph_to_json(pipeline_graph, os.path.dirname(os.path.abspath(filename)))
+    # allow_nan=False makes sure that we only ever write real JSON.
+    text = json.dumps(data, indent=2, ensure_ascii=False, allow_nan=False)
+    with open(filename, "w", encoding="utf-8") as fh:
+        fh.write(text + "\n")
 
 
 def write_config_node_string(node: PipelineNode, base_dir: str = ""):

@@ -95,7 +95,7 @@ class ScalarParam(BaseParam):
     def get_json_data(self, base_dir="."):
         return self.value
 
-    def set_json_data(self, value):
+    def set_json_data(self, value, base_dir="."):
         self.set_value(value)
 
 
@@ -143,10 +143,15 @@ class MultiValueParam(BaseParam):
         return { "title": self.label, "type": "array" }
 
     def get_json_data(self, base_dir="."):
-        return self._values
+        # a set isn't valid JSON, and the order should be stable
+        return sorted(self._values, key=str)
 
-    def set_json_data(self, value):
-        self.set_values(value)
+    def set_json_data(self, value, base_dir="."):
+        # one at a time with set_value, as set_parameter does, so that subclasses
+        # (MultiChoiceParam) can note any values which aren't in their choices yet.
+        self.reset_value()
+        for v in value:
+            self.set_value(v)
 
 class ScalarWithOperatorsParam(ScalarParam):
     # Operator Methods which apply to both StringParams and
@@ -205,6 +210,9 @@ class StringParam(ScalarWithOperatorsParam):
 
     def get_json_schema(self):
         return { "title": self.label, "type": "string" }
+
+    def get_json_data(self, base_dir="."):
+        return self._value or ""
 
 
 class TextParam(StringParam):
@@ -289,6 +297,24 @@ class FloatParam(NumericParam):
     _value: float = 0.0
     var_type = float
 
+    # NaN and the infinities can't be written as JSON numbers.
+    NON_FINITE = ("NaN", "Infinity", "-Infinity")
+
+    def get_json_schema(self):
+        return {"title": self.label, "anyOf": [{"type": "number"}, {"enum": list(self.NON_FINITE)}]}
+
+    def get_json_data(self, base_dir="."):
+        value = self._value
+        if isinstance(value, float) and not math.isfinite(value):
+            return "NaN" if math.isnan(value) else ("Infinity" if value > 0 else "-Infinity")
+        return None if value is None else float(value)
+
+    def set_json_data(self, value, base_dir="."):
+        if isinstance(value, str) and value in self.NON_FINITE:
+            self._value = float(value)
+        else:
+            self.set_value(value)
+
 
 class DecimalParam(NumericParam):
     _value: Decimal = Decimal(0)
@@ -311,6 +337,9 @@ class BooleanParam(ScalarParam):
 
     def __bool__(self):
         return self._value or False
+
+    def get_json_data(self, base_dir="."):
+        return bool(self._value)
 
     def __str__(self):
         return str(self._value)
@@ -405,10 +434,19 @@ class FileBaseParam(StringParam):
     def get_json_data(self, base_dir="."):
         if not self.value:
             return ""
-        if base_dir:
-            return os.path.relpath(self.get_file_path(), base_dir)
-        else:
-            return os.path.abspath(self.get_file_path())
+        try:
+            if base_dir:
+                return os.path.relpath(self.get_file_path(), base_dir)
+        except ValueError:
+            # relpath can fail on Windows
+            pass
+        return os.path.abspath(self.get_file_path())
+
+    def set_json_data(self, value, base_dir="."):
+        # as set_parameter does: filenames are relative to the directory the config is in.
+        if value:
+            self.set_base_dir(base_dir)
+        self.set_value(value)
 
 class FileParam(FileBaseParam):
     """A filename to be read as input."""
@@ -522,7 +560,7 @@ class DictChoiceParam(ScalarWithOperatorsParam):
     def get_json_data(self, base_dir="."):
         return self._choice
 
-    def set_json_data(self, value):
+    def set_json_data(self, value, base_dir="."):
         self.set_choice(value)
 
 
@@ -574,7 +612,6 @@ class ChoiceParam(ScalarWithOperatorsParam):
 
     def set_choices(self, choices: Iterable[str]):
         self.choices = list(choices)
-        print("SC %s %s" % (id(self), repr(self.choices)))
         if self.choices:
             if self._value not in self.choices:
                 self._value = self.choices[0]
@@ -590,13 +627,12 @@ class ChoiceParam(ScalarWithOperatorsParam):
         return self.__class__(self.label, self.value, self.choices)
 
     def get_json_schema(self):
-        print("GJS %s %s" % (id(self), repr(self.choices)))
         return { "title": self.label, "enum": self.choices }
 
     def get_json_data(self, base_dir="."):
         return self._value
 
-    def set_json_data(self, value):
+    def set_json_data(self, value, base_dir="."):
         self.set_value(value)
 
 
@@ -633,6 +669,10 @@ class MultiChoiceParam(MultiValueParam):
 
     def get_json_schema(self):
         return { "title": self.label, "type": "array", "items": { "enum": self.choices }}
+
+    def get_json_data(self, base_dir="."):
+        extra = sorted((v for v in self._values if v not in self.choices), key=str)
+        return [c for c in self.choices if c in self._values] + extra
 
 
 class DataTypeChoiceParam(ChoiceParam):
@@ -759,8 +799,6 @@ class ColumnGroupChoiceParam(ChoiceParam):
     def get_output_columns(self, prefix: str) -> list[str]:
         return [prefix + s for s in self.get_suffixes()]
 
-    def get_json_data(self, base_dir="."):
-        return self.get_column_prefix()
 
 
 class ColumnGroupOrNoneChoiceParam(ColumnGroupChoiceParam):
@@ -871,7 +909,7 @@ class ColumnOrStringParam(ColumnChoiceParam):
         else:
             return { "string": self.value }
 
-    def set_json_data(self, value):
+    def set_json_data(self, value, base_dir="."):
         if 'column' in value:
             self.value = self.PREFIX + value['column']
         elif 'string' in value:
@@ -926,7 +964,7 @@ class ColumnOrIntegerParam(ColumnOrStringParam):
         else:
             return { "integer": self.value }
 
-    def set_json_data(self, value):
+    def set_json_data(self, value, base_dir="."):
         if 'column' in value:
             self.value = self.PREFIX + value['column']
         elif 'integer' in value:
@@ -989,10 +1027,18 @@ class HasSubParametersMixin:
             for key, param in self.params.items()
         }
 
-    def set_json_data(self, value):
+    def set_json_data(self, value, base_dir="."):
+        # As with the .ini loader, a parameter which doesn't exist (any more) or can't
+        # take the value it's given is a warning rather than a reason to give up.
         for k, v in value.items():
-            p = self.params[k]
-            p.set_json_data(v)
+            param = self.params.get(k)
+            if param is None:
+                logger.warning("Parameter %s=%s Not Found", k, v)
+                continue
+            try:
+                param.set_json_data(v, base_dir)
+            except (KeyError, ValueError, TypeError):
+                logger.warning("Parameter %s=%s Not Valid", k, v)
 
     def set_parameter(self, key: str, value: Union[bool, int, float, str], base_dir: str = "."):
         if "." in key:
@@ -1133,10 +1179,16 @@ class ArrayParam(BaseParam):
             [ p.get_json_data(base_dir) for p in self.params ]
         )
 
-    def set_json_data(self, value):
+    def set_json_data(self, value, base_dir="."):
         self.params = []
         for v in value:
-            self.add_row().set_json_data(v)
+            if self.max_size is not None and len(self.params) >= self.max_size:
+                logger.warning("Too many rows for %s (maximum %d)", self.label, self.max_size)
+                break
+            row = self.param.copy()
+            self.params.append(row)
+            row.set_json_data(v, base_dir)
+        self.relabel()
 
     def get_hash_value(self):
         digest = hashlib.new(PARAM_DIGEST_HASH)
@@ -1213,11 +1265,17 @@ class PerColumnArrayParam(ArrayParam):
             for p in self.params
         }
 
-    def set_json_data(self, value):
+    def set_json_data(self, value, base_dir="."):
         self.params = []
-        for k, v in value:
+        rows = []
+        for k, v in value.items():
             p = self.add_row()
-            p.set_json_data(v)
+            if p is None:
+                break
+            p.set_json_data(v, base_dir)
+            rows.append((p, k))
+        # (add_row calls relabel() which renames every row, so only name them at the end)
+        for p, k in rows:
             p.label = k
 
 

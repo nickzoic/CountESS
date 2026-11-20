@@ -12,7 +12,7 @@ from countess.core.pipeline import PipelineGraph
 
 logger = logging.getLogger(__name__)
 
-usage = """usage: countess_cmd [--set NODENAME.CONFIG=VALUE] [--log LEVEL] [INIFILE ...]
+usage = """usage: countess_cmd [--set NODENAME.CONFIG=VALUE] [--log LEVEL] [CONFIGFILE ...]
 
 Run a CountESS configuration from the command line.
 
@@ -21,7 +21,7 @@ options:
     --version                      show version
     --set NODENAME.CONFIG=VALUE    override configuration file value
     --log LEVEL                    set log level to LEVEL
-    INIFILE                        run from configuration file
+    CONFIGFILE                     run from configuration file (.ini or .json)
 """
 
 
@@ -64,7 +64,7 @@ def configure_graphs(args: list[str]) -> Iterable[PipelineGraph]:
     for filename in args:
         try:
             graph = read_config([filename])
-        except IOError as exc:
+        except (IOError, ValueError) as exc:
             logger.error("Error reading %s: %s", filename, exc)
             sys.exit(2)
 

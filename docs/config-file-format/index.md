@@ -8,6 +8,11 @@ While CountESS is intended to be used via the GUI, the config file
 is designed to be editable if necessary and to be compatible with
 revision control systems.
 
+Configuration can also be stored as [JSON](#json-format), which is more
+convenient for other programs to read and write.  CountESS chooses which format
+to use from the name of the file: anything ending in `.json` is JSON, and
+anything else is .INI.  The two hold the same information.
+
 ## Sections & Modules
 
 .INI files are grouped into sections.
@@ -115,3 +120,47 @@ with some small caveats:
   in revision control.
 
 These issues are all potentially addressable in future versions of the software.
+
+## JSON Format
+
+A JSON config file is a single object.  Every node of the data flow graph is
+an entry in the `nodes` list, and parents are named rather than nested so the
+nodes can be in any order:
+
+    {
+      "format": "countess-config",
+      "version": 1,
+      "countess_version": "0.1.28",
+      "nodes": [
+        {
+          "name": "CSV Load",
+          "uuid": "6cd3f5c1144152db536a2caf0f555eae",
+          "plugin": {
+            "module": "countess.plugins.csv",
+            "class": "LoadCsvPlugin",
+            "version": "0.1.28",
+            "hash": "..."
+          },
+          "parameters": {
+            "files": [{"filename": "input1.csv"}],
+            "delimiter": ",",
+            "header": true,
+            "columns": [{"name": "thing", "type": "STRING"}]
+          },
+          "position": [0.3, 0.25],
+          "sort": {"column": 0, "descending": false},
+          "notes": "Some notes"
+        }
+      ]
+    }
+
+Only `format`, `version` and each node's `name` are required.  A node without a
+`plugin` is one which hasn't been set up yet.  `parameters` holds the plugin's
+configuration as produced by the plugin's `get_json_data()` method, and
+filenames in it are relative to the directory containing the config file, as
+in .INI files.  `NaN` and the infinities (which JSON can't represent) are
+written as the strings `"NaN"`, `"Infinity"` and `"-Infinity"`.
+
+Parameters which don't exist (any more) or which can't take the value they've
+been given are reported as warnings and skipped when loading, in the same way
+as with .INI files.

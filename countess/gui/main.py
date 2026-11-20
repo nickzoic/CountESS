@@ -23,7 +23,14 @@ import duckdb
 import psutil
 
 from countess import VERSION
-from countess.core.config import config_to_graph, export_config_graphviz, graph_to_config, read_config, write_config
+from countess.core.config import (
+    config_to_graph,
+    export_config_graphviz,
+    graph_to_config,
+    is_json_filename,
+    read_config,
+    write_config,
+)
 from countess.core.pipeline import PipelineGraph, PipelineNode, PipelineNodeStatus
 from countess.core.plugins import get_plugin_classes
 from countess.gui.config import PluginConfigurator
@@ -41,7 +48,7 @@ from countess.gui.widgets import (
 
 preview_row_limit: Optional[int] = int(psutil.virtual_memory().available / 1024 / 1024 / 1024) * 10000
 
-usage = """usage: countess_gui [--log LEVEL] [INIFILE]
+usage = """usage: countess_gui [--log LEVEL] [CONFIGFILE]
 
 Start the CountESS GUI.
 
@@ -50,7 +57,7 @@ options:
     --version                      show version
     --preview LIMIT                set preview mode row limit (default: %s)
     --log LEVEL                    set log level to LEVEL
-    INIFILE                        load configuration file
+    CONFIGFILE                     load configuration file (.ini or .json)
 """ % (
     preview_row_limit or "NONE"
 )
@@ -474,6 +481,14 @@ class LoggerFrame(tk.Frame):
             pbar.destroy()
 
 
+# the first is for loading only, the rest are also what can be saved.
+CONFIG_FILE_TYPES = [
+    ("Config Files", ["*.ini", "*.json"]),
+    (".INI Config File", "*.ini"),
+    ("JSON Config File", "*.json"),
+]
+
+
 class MainWindow:
     """Arrange the parts of the main window, with the FrameWrapper on the top
     left and the ConfiguratorWrapper either beside it or under it depending on
@@ -603,15 +618,24 @@ class MainWindow:
 
     def config_load(self, filename=None):
         if not filename:
-            filename = ask_open_filename(file_types=[(".INI Config File", "*.ini")])
+            filename = ask_open_filename(file_types=CONFIG_FILE_TYPES)
         if not filename:
             return
+
+        # read it before touching anything, so a bad file leaves the current config alone
+        try:
+            graph = read_config([filename])
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.warning("Couldn't load %s: %s", filename, exc)
+            messagebox.showerror("Load Config", f"Couldn't load {filename}:\n{exc}")
+            return
+
         self.config_filename = filename
         self.config_changed = False
         self.update_title()
 
         self._discard_graph()
-        self.graph = read_config([filename])
+        self.graph = graph
         self.graph.preview_row_limit = preview_row_limit
         self.graph.reset()
         self.graph_wrapper = GraphWrapper(self.tree_canvas, self.graph, self.node_select)
@@ -621,12 +645,13 @@ class MainWindow:
         if not filename:
             filename = ask_saveas_filename(
                 initial_file=self.config_filename,
-                file_types=[(".INI Config File", "*.ini")],
+                file_types=CONFIG_FILE_TYPES[1:],
             )
         if not filename:
             return
-        if not filename.endswith(".ini"):
-            filename = filename + ".ini"
+        if not filename.lower().endswith((".ini", ".json")):
+            # no extension given: keep to the format of the file we have
+            filename += ".json" if self.config_filename and is_json_filename(self.config_filename) else ".ini"
         write_config(self.graph, filename)
         self.config_filename = filename
         self.config_changed = False
@@ -638,7 +663,7 @@ class MainWindow:
     def config_export(self, filename=None):
         if not filename:
             if self.config_filename:
-                initialfile = self.config_filename.removesuffix(".ini") + ".dot"
+                initialfile = os.path.splitext(self.config_filename)[0] + ".dot"
             else:
                 initialfile = None
             filename = ask_saveas_filename(initial_file=initialfile, file_types=[("Graphviz File", "*.dot")])

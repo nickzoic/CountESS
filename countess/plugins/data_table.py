@@ -57,6 +57,15 @@ class DataTablePlugin(DuckdbInputPlugin):
             self.fix_columns()
         super().set_parameter(key, *a, **k)
 
+    def set_json_data(self, value, base_dir="."):
+        # The same applies as for set_parameter: the rows are made of whatever
+        # the columns say they are, so the columns have to be loaded first and
+        # the rows rebuilt to match, before any rows can be loaded.
+        super().set_json_data({k: v for k, v in value.items() if k != "rows"}, base_dir)
+        if "rows" in value:
+            self.fix_columns()
+            super().set_json_data({"rows": value["rows"]}, base_dir)
+
     def execute(
         self, ddbc: DuckDBPyConnection, source: None, row_limit: Optional[int] = None
     ) -> Optional[DuckDBPyRelation]:

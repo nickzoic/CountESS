@@ -33,10 +33,10 @@ New Config
 : Clear all configuration and start from nothing
 
 Load Config
-: Load a configuration from an .INI file
+: Load a configuration from an .INI or .json file
 
 Save Config
-: Save the current configuration to an .INI file
+: Save the current configuration to an .INI or .json file (a name ending in `.json` is saved as JSON)
 
 ## The dataflow graph
 
@@ -106,8 +106,8 @@ To perform a complete run using the entire input file, click 'Run'.
 
 ## CLI
 
-Plugin configurations can be saved and loaded in .INI file format.
-CountESS can also be run in headless mode with `countess_cmd your_config.ini`.
+Plugin configurations can be saved and loaded in .INI or JSON file format.
+CountESS can also be run in headless mode with `countess_cmd your_config.ini` or `countess_cmd your_config.json`.
 In headless mode, all output is to the console.
 
 # NEXT
