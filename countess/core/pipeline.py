@@ -13,10 +13,26 @@ from countess.core.plugins import BasePlugin, DuckdbPlugin, get_plugin_classes
 
 logger = logging.getLogger(__name__)
 
-# The GUI thread edits the graph (adding/removing nodes and links) while the
-# background worker is walking it, so all structural changes and all traversals
-# take this lock.  It is only ever held for the duration of a few set/list
-# operations, never while a query is running.
+# Threading model
+# ---------------
+# In the GUI there are two threads: the Tk thread, where the user edits nodes,
+# links and parameters, and a worker thread (see PipelineGraph._thread_target)
+# which recalculates whichever nodes have gone DIRTY.  The rules for keeping them
+# out of each other's way are:
+#
+# * Neither ever waits for the other for long.  The Tk thread calls
+#   PipelineGraph.update() whenever something changes, which only asks for a
+#   recalculation (and interrupts a running query if it has gone out of date).
+# * Each thread has its own DuckDB connection: PipelineGraph.ddbc is for the Tk
+#   thread, PipelineGraph.thread_cursor is for the worker.
+# * A change is never lost: PipelineNode.mark_dirty() bumps the node's
+#   `generation`, and a run which started before that discards its result
+#   (PipelineNode._settle) and leaves the node DIRTY to be run again.
+# * Structural changes to the graph, and anything which walks it, take
+#   GRAPH_LOCK.  It is held for a few set/list operations, never for a query.
+# * Plugin parameters are not locked.  The Tk thread may edit them while a run
+#   is reading them, but any such edit makes the node stale (see above), so
+#   whatever the run read is thrown away.
 GRAPH_LOCK = threading.RLock()
 
 

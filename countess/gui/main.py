@@ -6,6 +6,7 @@ import os
 import queue
 import re
 import sys
+import time
 
 try:
     import tkinter as tk
@@ -114,6 +115,11 @@ class ConfiguratorWrapper:
     info_frame: Optional[tk.Frame] = None
     configurator: Optional[PluginConfigurator] = None
 
+    # Timings, in milliseconds.
+    CHANGE_DEBOUNCE_MS = 200  # how long config changes have to stop for before the pipeline is told
+    RESULT_POLL_MS = 250  # how often to check if a node has finished calculating
+    PREVIEW_POLL_MS = 100  # how often to check if there's a result to show a preview of
+
     def __init__(self, tk_parent, node, ddbc, change_callback):
         logger.debug("ConfiguratorWrapper %s %s", node.name, node.uuid)
         self.node = node
@@ -130,6 +136,8 @@ class ConfiguratorWrapper:
         self._change_after_id: Optional[str] = None
         self._poll_after_id: Optional[str] = None
         self._preview_after_id: Optional[str] = None
+        # the node's generation (see PipelineNode.generation) when the preview was made
+        self._preview_generation: Optional[int] = None
 
         self.frame = ResizingFrame(tk_parent, orientation=ResizingFrame.Orientation.VERTICAL, bg="darkgrey")
         self.subframe = self.frame.add_frame()
@@ -259,6 +267,10 @@ class ConfiguratorWrapper:
         if self.preview_subframe or not self.node.plugin or not self.node.plugin.show_preview:
             return
 
+        # (noted before looking at the status: if the node changes after this
+        # the generation will no longer match and the preview will be remade)
+        generation = self.node.generation
+
         if self.node.status == PipelineNodeStatus.ERROR:
             logger.debug("ConfiguratorWrapper.show_preview_subframe %s", self.node.message)
             self.preview_subframe = tk.Frame(self.frame)
@@ -267,6 +279,7 @@ class ConfiguratorWrapper:
             text["state"] = "disabled"
             text.grid(sticky=tk.NSEW)
             self.frame.add_child(self.preview_subframe)
+            self._preview_generation = generation
 
         elif self.node.status == PipelineNodeStatus.RESULT:
             logger.debug("ConfiguratorWrapper.show_preview_subframe %s", self.node.table_name)
@@ -279,14 +292,15 @@ class ConfiguratorWrapper:
                 # reading it: the node is about to be DIRTY, so try again shortly.
                 logger.debug("ConfiguratorWrapper.show_preview_subframe table not available, retrying")
                 preview.destroy()
-                self._preview_after_id = self._after(100, self.show_preview_subframe)
+                self._preview_after_id = self._after(self.PREVIEW_POLL_MS, self.show_preview_subframe)
                 return
             preview.set_callback(self.preview_changed_callback)
             self.preview_subframe = preview
             self.frame.add_child(self.preview_subframe)
+            self._preview_generation = generation
 
         else:
-            self._preview_after_id = self._after(100, self.show_preview_subframe)
+            self._preview_after_id = self._after(self.PREVIEW_POLL_MS, self.show_preview_subframe)
 
     def hide_preview_subframe(self):
         logger.debug("ConfiguratorWrapper.hide_preview_subframe %s %s", self.node.name, self.node.uuid)
@@ -295,10 +309,20 @@ class ConfiguratorWrapper:
         if self.preview_subframe:
             self.frame.remove_child(self.preview_subframe).destroy()
             self.preview_subframe = None
+        self._preview_generation = None
 
     def replace_preview_subframe(self):
         self.hide_preview_subframe()
         self.show_preview_subframe()
+
+    def update_preview_subframe(self):
+        """Make the preview show the node's current result.  Making a preview is
+        slow (it gets as many text widgets as the table has columns) so if the node
+        hasn't changed since it was made, as when going back to a node which was
+        selected earlier, it's left as it is."""
+        if self.preview_subframe is not None and self._preview_generation == self.node.generation:
+            return
+        self.replace_preview_subframe()
 
     def notify(self):
         self._cancel(self._poll_after_id)
@@ -324,7 +348,7 @@ class ConfiguratorWrapper:
         for things to settle down before disturbing the pipeline."""
         logger.debug("config_change_callback %s", self.node.name)
         self._cancel(self._change_after_id)
-        self._change_after_id = self._after(200, self._config_change_fire)
+        self._change_after_id = self._after(self.CHANGE_DEBOUNCE_MS, self._config_change_fire)
 
     def _config_change_fire(self):
         self._change_after_id = None
@@ -333,7 +357,7 @@ class ConfiguratorWrapper:
 
     def _start_poll(self):
         if self._poll_after_id is None:
-            self._poll_after_id = self._after(250, self.config_change_poll_callback)
+            self._poll_after_id = self._after(self.RESULT_POLL_MS, self.config_change_poll_callback)
 
     def config_change_poll_callback(self):
         logger.debug("ConfiguratorWrapper.config_change_poll_callback")
@@ -348,7 +372,7 @@ class ConfiguratorWrapper:
 
     def config_change_poll_done(self):
         logger.debug("ConfiguratorWrapper.config_change_poll_done")
-        self.replace_preview_subframe()
+        self.update_preview_subframe()
         if self.config_scrollbar and self.configurator:
             pos1, pos2 = self.config_scrollbar.get()
             self.configurator.update()
@@ -418,7 +442,12 @@ class _CallbackLoggingHandler(logging.Handler):
 
 
 class LoggerFrame(tk.Frame):
-    def __init__(self, *a, **k) -> None:
+    LOGGING_TIME_BUDGET = 0.02  # seconds per call to logging_event
+    LOGGING_MAX_LINES = 5000  # lines of log to keep
+
+    def __init__(self, *a, log_queue=None, **k) -> None:
+        """`log_queue` is where log records come from, by default the one which the
+        main program's logging is sent to."""
         super().__init__(*a, **k)
         self.count = 0
         self.text = tk.Text(self)
@@ -435,7 +464,7 @@ class LoggerFrame(tk.Frame):
 
         # XXX tkinter doesn't seem happy with updating widgets from threads,
         # so here's an alternative, we poll from a tkinter event.
-        self.logging_handler = logging.handlers.QueueListener(logging_queue)
+        self.logging_handler = logging.handlers.QueueListener(log_queue if log_queue is not None else logging_queue)
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
@@ -444,16 +473,31 @@ class LoggerFrame(tk.Frame):
         self.logging_event()
 
     def logging_event(self, ev=None):
-        try:
-            for _ in range(0, 10):
+        """Show whatever's arrived on the log queue.  Called regularly from the Tk
+        event loop, it works through the queue for a short time (so the GUI stays
+        responsive even if something is logging thousands of messages) and adds
+        the text to the log in one go."""
+        lines: list[str] = []
+        deadline = time.monotonic() + self.LOGGING_TIME_BUDGET
+        backlog = False
+        while True:
+            try:
                 rec = self.logging_handler.dequeue(block=False)
-                if rec:
-                    self.logging_callback(rec)
-            self.after(100, self.logging_event)
-        except queue.Empty:
-            self.after(100, self.logging_event)
+            except queue.Empty:
+                break
+            if rec:
+                self.logging_callback(rec, lines)
+            if time.monotonic() > deadline:
+                backlog = True
+                break
+        if lines:
+            self.add_lines(lines)
+        # if there's more to do, come back to it soon.
+        self.after(10 if backlog else 100, self.logging_event)
 
-    def logging_callback(self, record: logging.LogRecord) -> None:
+    def logging_callback(self, record: logging.LogRecord, lines: Optional[list[str]] = None) -> None:
+        """Handle one record: progress messages update their progress bar, anything
+        else is added to `lines` (or shown straight away if no list is given)"""
         message = record.getMessage()
         if m := re.match(r"(.*): (\d+(?:\.\d+)?)(%|/\d+)", message):
             name, n1, n2 = m.groups()
@@ -470,10 +514,23 @@ class LoggerFrame(tk.Frame):
                     self.after(5000, self.hide_event, name)
             else:
                 pbar.progress_update(message)
+        elif lines is not None:
+            lines.append(message + "\n")
         else:
-            self.text.insert(tk.END, message + "\n")
-            self.text.after(10, self.text.see, tk.END)
-            self.count += 1
+            self.add_lines([message + "\n"])
+
+    def add_lines(self, lines: list[str]) -> None:
+        # Only follow the end of the log if that's where we were looking already.
+        following = self.text.yview()[1] >= 0.999
+        self.text.insert(tk.END, "".join(lines))
+        self.count += len(lines)
+
+        # Don't let a long run's worth of log grow without limit.
+        n_lines = int(self.text.index("end-1c").split(".")[0]) - 1  # (the last line is empty)
+        if n_lines > self.LOGGING_MAX_LINES:
+            self.text.delete("1.0", f"{n_lines - self.LOGGING_MAX_LINES + 1}.0")
+        if following:
+            self.text.see(tk.END)
 
     def hide_event(self, name):
         pbar = self.progress_bars.pop(name, None)

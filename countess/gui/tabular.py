@@ -1,6 +1,7 @@
 import io
 import logging
 import tkinter as tk
+from tkinter import font as tk_font
 from functools import partial
 from math import ceil, floor, isinf, isnan
 from tkinter import ttk
@@ -97,7 +98,9 @@ class TabularDataFrame(tk.Frame):
     table: Optional[DuckDBPyRelation] = None
     table_order: str = ""
     offset = 0
-    height = 1000
+    # How many rows to fetch before we know how many fit.  Once the widget is on
+    # screen _reset_height works it out properly.
+    height = 50
     length = 0
     select_rows = None
     labels: list[tk.Label] = []
@@ -166,7 +169,7 @@ class TabularDataFrame(tk.Frame):
         self.subframe = ResizingFrame(self, orientation=ResizingFrame.Orientation.HORIZONTAL, bg="darkgrey")
         self.subframe.pack(side="left", fill="both", expand=True)
 
-        self.label["text"] = f"Dataframe Preview {len(self.table)} rows"
+        self.label["text"] = f"Dataframe Preview {self.length} rows"
 
         self.columns = []
         for num, (name, dtype) in enumerate(zip(column_names, column_dtypes)):
@@ -213,8 +216,8 @@ class TabularDataFrame(tk.Frame):
         for column_num, (column_widget, column_format) in enumerate(zip(self.columns, self.column_formats)):
             column_widget["state"] = tk.NORMAL
             column_widget.delete("1.0", tk.END)
-            for row in rows:
-                column_widget.insert(tk.END, format_value(row[column_num], column_format) + "\n")
+            # (one call to Tk for the whole column, as each call has a fixed cost)
+            column_widget.insert(tk.END, "".join(format_value(row[column_num], column_format) + "\n" for row in rows))
             column_widget["state"] = tk.DISABLED
 
         if self.length:
@@ -285,9 +288,9 @@ class TabularDataFrame(tk.Frame):
         else:
             self.refresh()
 
-    # XXX the following two functions are clever but not
-    # very efficient!  There's got to be a nicer way of
-    # detecting this surely?
+    # The number of rows which fit is found by guessing (see _estimate_height) and
+    # then letting _column_yscrollcommand correct the guess.  There's probably a
+    # nicer way of detecting this, but at least it's now a cheap guess.
 
     def _column_yscrollcommand(self, y1, y2):
         # All this actually does is to detect if there's
@@ -299,18 +302,47 @@ class TabularDataFrame(tk.Frame):
             self.height = span
             self.refresh()
 
+    _reset_after_id: Optional[str] = None
+    _linespace: Optional[int] = None
+
     def _configure(self, *_):
         # the delay lets the sub-elements configure
-        # themselves before we try to measure them.
-        self.after(10, self._reset_height)
+        # themselves before we try to measure them.  A window being resized
+        # makes lots of these events, so only one reset is kept waiting.
+        if self._reset_after_id:
+            self.after_cancel(self._reset_after_id)
+        self._reset_after_id = self.after(10, self._reset_height)
+
+    def destroy(self):
+        if self._reset_after_id:
+            self.after_cancel(self._reset_after_id)
+            self._reset_after_id = None
+        super().destroy()
+
+    def _estimate_height(self) -> int:
+        """A number of rows which is at least as many as will fit.  It doesn't need to
+        be exact because _column_yscrollcommand trims it down to what's visible, but it
+        does need to be enough, and starting near is much cheaper than starting at 1000
+        and fetching and drawing all of those just to find out."""
+        default = 1000
+        if not self.columns:
+            return default
+        try:
+            widget = self.columns[0]
+            if self._linespace is None:
+                self._linespace = tk_font.Font(font=widget["font"]).metrics("linespace")
+            pixels = widget.winfo_height()
+        except tk.TclError:
+            return default
+        if pixels <= 1 or not self._linespace:
+            return default  # not on screen yet, so can't tell
+        return min(default, pixels // self._linespace + 3)
 
     def _reset_height(self):
+        self._reset_after_id = None
         if not self.winfo_exists():
             return
-        # Start with a huge number of rows and let
-        # _cw_yscrollcommand trim it back down again.
-        # Probably could be more efficient.
-        self.height = min(self.length, 1000)
+        self.height = min(self.length, self._estimate_height())
         self.refresh()
 
     def _column_scroll(self, event):
