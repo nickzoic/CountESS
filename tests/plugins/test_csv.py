@@ -147,7 +147,7 @@ def load_csv(connection, *filenames, **params):
     return plugin, plugin.execute(connection, None)
 
 
-@pytest.mark.parametrize("delimiter,sep", [(",", ","), (";", ";"), ("TAB", "\t"), ("SPACE", " ")])
+@pytest.mark.parametrize("delimiter,sep", [(",", ","), (";", ";"), ("|", "|"), ("TAB", "\t"), ("SPACE", " ")])
 def test_save_delimiters(csv_ddbc, tmp_path, delimiter, sep):
     text = save_csv(csv_ddbc, tmp_path / "out.csv", delimiter=delimiter)
     lines = text.splitlines()
@@ -301,22 +301,11 @@ def test_newlines_in_quoted_fields(csv_ddbc, tmp_path):
     assert output.fetchall() == [(1, "line one\nline two"), (2, "plain")]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason='the "CSV header row?" setting is never passed on to the code which writes the file, so there is '
-    "always a header row",
-)
 def test_header_row_can_be_left_out(csv_ddbc, tmp_path):
     text = save_csv(csv_ddbc, tmp_path / "out.csv", header=False)
     assert text.splitlines()[0] == '1,"a b",2.5'
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=KeyError,
-    reason="| is one of the choices of delimiter, but it's not in the table which looks the delimiters up when saving "
-    "(it is when loading)",
-)
 def test_save_with_a_pipe_as_delimiter(csv_ddbc, tmp_path):
     text = save_csv(csv_ddbc, tmp_path / "out.csv", delimiter="|")
     assert text.splitlines()[1] == '1|"a b"|2.5'
@@ -324,3 +313,51 @@ def test_save_with_a_pipe_as_delimiter(csv_ddbc, tmp_path):
 
 def test_combining_nothing_gives_nothing(csv_ddbc):
     assert LoadCsvPlugin().combine(csv_ddbc, []) is None
+
+
+@pytest.mark.parametrize("quoting", [True, False], ids=["quoting non-numbers", "minimal quoting"])
+@pytest.mark.parametrize("header", [True, False])
+def test_header_row_either_way_and_with_either_kind_of_quoting(csv_ddbc, tmp_path, quoting, header):
+    # (quoting the non-numbers is done by pandas, and minimal quoting by DuckDB: both have to do what they're told)
+    csv_ddbc.sql("create or replace table t as select * from (values (1, 'a'), (2, 'b')) v(n, s)")
+    lines = save_csv(csv_ddbc, tmp_path / "out.csv", quoting=quoting, header=header).splitlines()
+    assert len(lines) == (3 if header else 2)
+    assert (lines[0] in ('"n","s"', "n,s")) == header
+    assert lines[-1] in ('2,"b"', "2,b")
+
+
+def test_header_row_left_out_when_quoting_everything(csv_ddbc, tmp_path):
+    csv_ddbc.sql("create or replace table t as select * from (values (1, 'a'), (2, 'b')) v(n, s)")
+    for header, expected_lines in ((True, 3), (False, 2)):
+        path = tmp_path / f"all{header}.csv"
+        write_to_csv(csv_ddbc.table("t"), str(path), ",", csv_module.QUOTE_ALL, header=header)
+        assert len(path.read_text(encoding="utf-8").splitlines()) == expected_lines
+
+
+@pytest.mark.parametrize("header", [True, False])
+def test_header_row_in_a_compressed_file(csv_ddbc, tmp_path, header):
+    csv_ddbc.sql("create or replace table t as select * from (values (1, 'a'), (2, 'b')) v(n, s)")
+    for extension, opener in ((".bz2", bz2.open), (".gz", gzip.open)):
+        path = tmp_path / f"out.csv{extension}"
+        plugin = SaveCsvPlugin()
+        plugin.set_parameter("filename", str(path))
+        plugin.set_parameter("header", header)
+        source = csv_ddbc.table("t")
+        plugin.prepare(csv_ddbc, source)
+        plugin.execute(csv_ddbc, source)
+        with opener(path, "rt", encoding="utf-8") as fh:
+            assert len(fh.read().splitlines()) == (3 if header else 2), extension
+
+
+def test_the_header_is_written_once_however_many_chunks_there_are(csv_ddbc, tmp_path):
+    csv_ddbc.sql("create or replace table t as select range as n, 'x' as s from range(20000)")  # (several chunks)
+    for header in (True, False):
+        text = save_csv(csv_ddbc, tmp_path / f"big{header}.csv", header=header)
+        lines = text.splitlines()
+        assert len(lines) == 20000 + (1 if header else 0)
+        assert sum(1 for line in lines if line.startswith('"n"')) == (1 if header else 0)
+
+
+def test_every_delimiter_which_is_offered_can_be_saved():
+    plugin = SaveCsvPlugin()
+    assert set(plugin.delimiter.choices) <= set(plugin.SEPARATORS)

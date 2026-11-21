@@ -72,11 +72,6 @@ def test_columns_with_blank_names_are_given_them():
     assert output.fetchall() == [("x", 5, "y")]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a column which has never been given a name has None for one and only a blank name gets 'col_N' (the "
-    "test is `name == ''`), so it keeps the name None, and executing the table fails with a TypeError",
-)
 def test_columns_which_have_never_been_named_are_given_names_too():
     plugin = DataTablePlugin()
     column = plugin.columns.add_row()  # (as the + button does)

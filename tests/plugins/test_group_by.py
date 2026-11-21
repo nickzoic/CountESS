@@ -112,19 +112,12 @@ def test_one_row_for_every_column_of_the_input(ddbc, make_source):
     ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason='"Join Back?" makes a query with the text {table_name} and {group_by} in it: the second half is a plain '
-    "string and not an f-string (and the one with no group by is missing a closing bracket too). The error is "
-    "only logged, so what you get is nothing",
-)
 def test_aggregates_can_be_joined_back_on_to_the_rows(ddbc, make_source, assert_rows):
     source = make_source("select * from (values ('a', 1), ('a', 2), ('b', 5)) t(g, x)")
     _, output = group_by(ddbc, source, {"g": ["index"], "x": ["sum"]}, join=True)
     assert_rows(output, [("a", 1, 3), ("a", 2, 3), ("b", 5, 5)])
 
 
-@pytest.mark.xfail(strict=True, reason="the same mistake, in the part for when there's nothing to group by")
 def test_totals_can_be_joined_back_on_to_the_rows(ddbc, make_source, assert_rows):
     source = make_source("select * from (values ('a', 1), ('a', 2), ('b', 5)) t(g, x)")
     _, output = group_by(ddbc, source, {"x": ["sum"]}, join=True)

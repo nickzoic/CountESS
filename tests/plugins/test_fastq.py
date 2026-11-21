@@ -138,15 +138,7 @@ def test_no_files_gives_nothing(ddbc):
         (".fq", open),
         (".fastq.gz", lambda p, m: gzip.open(p, m)),
         pytest.param(".fastq.bz2", lambda p, m: bz2.open(p, m), marks=pytest.mark.filterwarnings("ignore:Compression")),
-        pytest.param(
-            ".fastq.xz",
-            lambda p, m: lzma.open(p, m),
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="after choosing the reader for .xz files the next test is an `if` and not an `elif`, so the "
-                "`else` of that one then replaces it with a reader of plain text, which can't read an xz file",
-            ),
-        ),
+        (".fastq.xz", lambda p, m: lzma.open(p, m)),
     ],
 )
 def test_compressed_files(ddbc, tmp_path, assert_rows, extension, opener):
@@ -199,11 +191,7 @@ def test_fasta_limit_and_filenames(ddbc, tmp_path, monkeypatch, assert_rows):
     [
         (".fasta.gz", lambda p, m: gzip.open(p, m)),
         pytest.param(".fa.bz2", lambda p, m: bz2.open(p, m), marks=pytest.mark.filterwarnings("ignore:Compression")),
-        pytest.param(
-            ".fasta.xz",
-            lambda p, m: lzma.open(p, m),
-            marks=pytest.mark.xfail(strict=True, reason="the same `if` / `else` mistake as in the FASTQ loader"),
-        ),
+        (".fasta.xz", lambda p, m: lzma.open(p, m)),
     ],
 )
 def test_compressed_fasta(ddbc, tmp_path, assert_rows, extension, opener):
@@ -230,12 +218,6 @@ def test_quality_limits_which_are_set_filter_the_reads(ddbc, fastq):
     assert "list_min" in quality_filters(ddbc, fastq, min_avg_quality=0, min_low_quality=5)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="`if self.min_avg_quality:` is a test of the parameter itself, which is true even when its value is 0 "
-    "(a StringParam or BooleanParam is not, but an IntegerParam or FloatParam is), so reads are always filtered "
-    "on both qualities even when the limits are 0, which can't make a difference",
-)
 def test_quality_limits_of_zero_mean_no_filtering(ddbc, fastq):
     sql = quality_filters(ddbc, fastq, min_avg_quality=0, min_low_quality=0)
     assert "list_avg" not in sql and "list_min" not in sql
