@@ -106,7 +106,8 @@ def write_config(pipeline_graph: PipelineGraph, filename: str):
     """Write `pipeline_graph`'s configuration out to `filename`, as JSON if
     its name ends in .json (see write_json_config) or as an .ini file otherwise."""
     if is_json_filename(filename):
-        return write_json_config(pipeline_graph, filename)
+        write_json_config(pipeline_graph, filename)
+        return
 
     base_dir = os.path.dirname(filename)
     cp = graph_to_config(pipeline_graph, base_dir)
