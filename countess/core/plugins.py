@@ -134,12 +134,10 @@ class DuckdbPlugin(BasePlugin):
     ) -> Optional[DuckDBPyRelation]:
         raise NotImplementedError(f"{self.__class__}.execute_multi")
 
-    def query_progress(self, ddbc: DuckDBPyConnection):
-        try:
-            # this is still a PR, if it doesn't exist then guess 50%.
-            return ddbc.query_progress()
-        except AttributeError:
-            return 50
+    def query_progress(self, ddbc: DuckDBPyConnection) -> float:
+        """How far the query running on `ddbc` has got, as a percentage, or -1 if
+        it isn't known (which is when no query is running, among other times)."""
+        return ddbc.query_progress()
 
 
 class DuckdbSimplePlugin(DuckdbPlugin):

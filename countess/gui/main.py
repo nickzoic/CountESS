@@ -32,7 +32,7 @@ from countess.core.config import (
     read_config,
     write_config,
 )
-from countess.core.pipeline import PipelineGraph, PipelineNode, PipelineNodeStatus
+from countess.core.pipeline import GraphProgress, PipelineGraph, PipelineNode, PipelineNodeStatus
 from countess.core.plugins import get_plugin_classes
 from countess.gui.config import PluginConfigurator
 from countess.gui.mini_browser import mini_browser_open
@@ -538,6 +538,88 @@ class LoggerFrame(tk.Frame):
             pbar.destroy()
 
 
+class QueryProgressFrame(tk.Frame):
+    """Progress bars for the queries the pipeline's background worker is running, and a
+    count of the nodes which are waiting for it.  It looks after itself: it polls the
+    graph a few times a second, appears when there's something to show and goes away
+    again when there isn't.
+
+    It has to be put in place with grid(), and takes `get_graph`, a function which says
+    which graph to look at (since that's replaced when a config is loaded)."""
+
+    POLL_MS = 250
+    # Most queries are over in no time, and a bar which flashes up and goes away again
+    # just makes the window jump around, so wait a little before showing anything.
+    SHOW_AFTER = 0.5  # seconds
+
+    def __init__(self, master, get_graph: Callable[[], Optional[PipelineGraph]], **kwargs) -> None:
+        super().__init__(master, **kwargs)
+        self.get_graph = get_graph
+        # Bars are kept and reused: each LabeledProgressbar adds a style to Tk which is never removed.
+        self.bars: list[LabeledProgressbar] = []
+        self.waiting_label = tk.Label(self, anchor=tk.W)
+        # (starts as shown because whoever made us has grid()ed us: the first poll
+        # takes us away again if there's nothing to show)
+        self.shown = True
+        self._layout: Optional[tuple[int, bool]] = None
+        self._active_since: Optional[float] = None
+        # (not straight away, so that whoever made us has time to grid() us)
+        self._after_id: Optional[str] = self.after(0, self._poll)
+
+    def _poll(self) -> None:
+        self._after_id = self.after(self.POLL_MS, self._poll)
+        graph = self.get_graph()
+        self.show_progress(graph.get_progress() if graph else None)
+
+    def show_progress(self, progress: Optional[GraphProgress]) -> None:
+        if progress is None or not progress.active:
+            self._active_since = None
+            if self.shown:
+                self.grid_remove()
+                self.shown = False
+            return
+
+        now = time.monotonic()
+        if self._active_since is None:
+            self._active_since = now
+        if now - self._active_since < self.SHOW_AFTER:
+            return
+
+        while len(self.bars) < len(progress.running):
+            self.bars.append(LabeledProgressbar(self, value=0))
+        for bar, entry in zip(self.bars, progress.running):
+            if entry.percent is None:
+                bar.progress_update(f"{entry.node.name}: working…")  # (shows as "indeterminate")
+            else:
+                bar.progress_update(f"{entry.node.name}: {entry.percent:.0f}%", entry.percent)
+
+        self.waiting_label["text"] = (
+            f"{progress.waiting} more waiting" if progress.running else f"{progress.waiting} waiting"
+        )
+        self._arrange(len(progress.running), progress.waiting > 0)
+
+        if not self.shown:
+            self.grid()  # (puts it back where it was before grid_remove)
+            self.shown = True
+
+    def _arrange(self, n_bars: int, show_waiting: bool) -> None:
+        if self._layout == (n_bars, show_waiting):
+            return
+        for widget in self.pack_slaves():
+            widget.pack_forget()
+        for bar in self.bars[:n_bars]:
+            bar.pack(fill=tk.X, padx=2, pady=1)
+        if show_waiting:
+            self.waiting_label.pack(fill=tk.X, padx=2)
+        self._layout = (n_bars, show_waiting)
+
+    def destroy(self) -> None:
+        if self._after_id:
+            self.after_cancel(self._after_id)
+            self._after_id = None
+        super().destroy()
+
+
 # the first is for loading only, the rest are also what can be saved.
 CONFIG_FILE_TYPES = [
     ("Config Files", ["*.ini", "*.json"]),
@@ -597,6 +679,9 @@ class MainWindow:
         self.frame.add_child(self.main_subframe, weight=4)
 
         self.logger_subframe = LoggerFrame(self.frame)
+        # (row 1 of the LoggerFrame's grid is the one it doesn't use)
+        self.progress_frame = QueryProgressFrame(self.logger_subframe, lambda: self.graph)
+        self.progress_frame.grid(row=1, column=0, columnspan=2, sticky=tk.EW)
         # self.logger = self.logger_subframe.get_logger("")
         # self.logger_subframe_show_task()
         self.frame.add_child(self.logger_subframe)
