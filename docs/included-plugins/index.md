@@ -56,6 +56,49 @@ delimiter
 quoting
 : whether to quote all string values, even if they don't appear to need it.  This can reduce the chance of data corruption with software which can otherwise confuse string values for dates or numbers.
 
+### Parquet Reader
+
+Loads data from [Apache Parquet](https://parquet.apache.org/) files.
+Parquet files record the name and type of each column, so unlike the CSV reader there is nothing to
+say about the columns: the types in the file are the types you get.
+
+If several files are loaded their columns are matched up by name, and any column
+missing from some of the files will be empty for the rows from those files.
+
+#### Parameters
+
+files
+: the files to read. Filenames can contain wildcards, for example `data/part-*.parquet`
+
+filename_column
+: if this is set, the filename will be added as a separate column. This is useful when reading many files at once
+
+*Note that Parquet files made by other software often have columns with a time zone, which need the `pytz` Python package to be shown in the preview. It is installed with CountESS.*
+
+### Parquet Writer
+
+Writes data out to an [Apache Parquet](https://parquet.apache.org/) file.
+Parquet is a compact binary format which records the type of every column, so unlike CSV it keeps integers
+as integers, and keeps nulls and text distinct, and is much faster to read back in again.  It is understood by
+most data analysis software (pandas, R, Spark, DuckDB and so on).
+
+Nothing is written while the data is only being previewed.  If the file already exists it is
+replaced only once the new one has been written successfully, so a problem part way through leaves the
+old file as it was.
+
+*Note that Parquet can't store 128 bit integers, which is what totals of integer columns (for example from the Group By plugin) are made by DuckDB.  Those columns are written as 64 bit integers.  A value too large for that is an error rather than being written inexactly.*
+
+#### Parameters
+
+filename
+: the filename to write. Any directories it is in which don't exist yet are created
+
+compression
+: how to compress the data: `SNAPPY` (the default, understood by everything), `ZSTD` and `BROTLI` (smaller), `GZIP`, `LZ4_RAW` (quick), or `UNCOMPRESSED`
+
+sorting
+: optionally, columns to sort the data by before it is written
+
 ### Data Table
 
 Sometimes you need a little bit of extra data joined into your tables but don't really want to have a separate CSV file.  Data Table lets you embed small amounts of data into the configuration directly.
