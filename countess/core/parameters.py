@@ -128,14 +128,17 @@ class MultiValueParam(BaseParam):
         return self.__class__(self.label, self._values)
 
     def get_parameters(self, key, base_dir="."):
-        yield from ((f"{key}.{n}", v) for n, v in enumerate(self._values))
+        # (not just enumerate(self._values): the order of a set depends on the order
+        # things were put in it and on Python's per-run string hash randomization, which
+        # would make the same config write out differently from one run to the next)
+        yield from ((f"{key}.{n}", v) for n, v in enumerate(self.get_json_data()))
 
     def set_parameter(self, key: str, value: Union[bool, int, float, str], base_dir: str = "."):
         self.set_value(value)
 
     def get_hash_value(self):
         digest = hashlib.new(PARAM_DIGEST_HASH)
-        for n, v in enumerate(self._values):
+        for n, v in enumerate(self.get_json_data()):
             digest.update((str(n) + repr(v)).encode("utf-8"))
         return digest.hexdigest()
 

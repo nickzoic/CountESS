@@ -4,6 +4,8 @@ import logging
 import math
 import os
 import shutil
+import subprocess
+import sys
 
 import pytest
 
@@ -460,3 +462,43 @@ def test_multi_value_param_is_a_sorted_list():
     other = P.MultiValueParam("m", {"left over"})
     other.set_json_data(data)
     assert other.get_values() == {"a", "b", "c"}
+
+
+MULTI_VALUE_SCRIPT = """
+import json
+from countess.core import parameters as P
+words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet"]
+plain = P.MultiValueParam("m", words)
+choice = P.MultiChoiceParam("c", choices=words)
+for w in reversed(words[::2]):
+    choice.set_value(w)
+print(json.dumps([list(plain.get_parameters("k")), plain.get_hash_value(),
+                  list(choice.get_parameters("k")), choice.get_hash_value()]))
+"""
+
+
+def test_multi_value_output_does_not_depend_on_hash_randomization():
+    """The values of a MultiValueParam are kept in a set, whose order depends on the
+    per-process string hash seed: what's written to a config file (and the hash of the
+    plugin) mustn't."""
+    outputs = set()
+    for seed in ("0", "1", "2", "3", "4", "5"):
+        result = subprocess.run(
+            [sys.executable, "-c", MULTI_VALUE_SCRIPT],
+            env={**os.environ, "PYTHONHASHSEED": seed},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        outputs.add(result.stdout.strip().splitlines()[-1])
+    assert len(outputs) == 1
+
+    plain_params, _, choice_params, _ = json.loads(outputs.pop())
+    assert [v for _, v in plain_params] == sorted(v for _, v in plain_params)  # (sorted, when there are no choices)
+    assert [v for _, v in choice_params] == [
+        "alpha",
+        "charlie",
+        "echo",
+        "golf",
+        "india",
+    ]  # in the order of the choices
