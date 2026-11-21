@@ -202,10 +202,11 @@ class ParameterWrapper:
         is in there then is more up to date than the parameter (which can't hold
         things like "-" or "1." on the way to "-5" or "1.5", or may have been
         cleaned up), and overwriting it moves the cursor and eats keystrokes."""
-        if not self._is_typeable():
+        entry = self.entry
+        if entry is None or not self._is_typeable():
             return False
         try:
-            return self.entry.focus_get() is self.entry
+            return entry.focus_get() is entry
         except (KeyError, tk.TclError):
             # focus_get raises KeyError if the focus is in a popdown (eg: a combobox list)
             return False

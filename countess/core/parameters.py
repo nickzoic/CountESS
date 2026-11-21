@@ -53,6 +53,18 @@ class BaseParam:
     def set_column_choices(self, choices: Mapping[str, bool]):
         pass
 
+    # The JSON interface: every kind of parameter has to implement these.
+    # (get_json_data and set_json_data's `base_dir` is what filenames are relative to.)
+
+    def get_json_schema(self) -> dict:
+        raise NotImplementedError(f"Implement {self.__class__.__name__}.get_json_schema()")
+
+    def get_json_data(self, base_dir=".") -> Any:
+        raise NotImplementedError(f"Implement {self.__class__.__name__}.get_json_data()")
+
+    def set_json_data(self, value, base_dir=".") -> None:
+        raise NotImplementedError(f"Implement {self.__class__.__name__}.set_json_data()")
+
 
 class ScalarParam(BaseParam):
     """A ScalarParam has a single value (use one of the subclasses below to give
@@ -861,7 +873,7 @@ class ColumnOrStringParam(ColumnChoiceParam):
     DEFAULT_VALUE: Any = ""
     PREFIX = "— "
 
-    column_choices = []
+    column_choices: list[str] = []
 
     def set_column_choices(self, choices: Mapping[str, bool]):
         self.column_choices = list(choices.keys())

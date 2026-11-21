@@ -611,7 +611,7 @@ class MainWindow:
         # On macOS, Quit (Cmd-Q or the application menu) runs ::tk::mac::Quit if it exists;
         # otherwise Tk calls exit() from inside mainloop(), and DuckDB's static destructors
         # then crash the interpreter. Quit the way the Exit button does instead.
-        tk_parent.createcommand("::tk::mac::Quit", self.program_exit)
+        tk_parent.tk.createcommand("::tk::mac::Quit", self.program_exit)
 
         logger.debug("MainWindow.__init__(%s)", repr(config_filename))
         if config_filename:
