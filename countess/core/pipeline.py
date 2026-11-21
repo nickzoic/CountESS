@@ -312,6 +312,12 @@ class PipelineGraph:
                 return node
         return None
 
+    def find_node_by_uuid(self, uuid: str) -> Optional[PipelineNode]:
+        for node in self.nodes:
+            if node.uuid == uuid:
+                return node
+        raise KeyError(uuid)
+
     def traverse_nodes(self) -> Iterable[PipelineNode]:
         """Nodes in dependency order (parents before children).  The order is
         worked out all at once, under the lock, so it is safe to iterate over
