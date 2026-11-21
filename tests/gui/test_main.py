@@ -1,12 +1,12 @@
 import time
 import tkinter as tk
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from countess.core.config import read_config
 from countess.core.pipeline import PipelineNode
-from countess.gui.main import ConfiguratorWrapper, PluginChooserFrame, make_root
+from countess.gui.main import ConfiguratorWrapper, MainWindow, PluginChooserFrame, make_root
 from countess.plugins.data_table import DataTablePlugin
 
 
@@ -48,3 +48,19 @@ def test_main():
 
     wrap.destroy()
     root.destroy()
+
+
+@pytest.mark.gui
+def test_mac_quit_runs_the_exit_button_code():
+    """On macOS Cmd-Q runs ::tk::mac::Quit if it exists, and that has to be the same as
+    pressing Exit or DuckDB's static destructors crash the interpreter."""
+    root = make_root()
+    try:
+        with patch.object(MainWindow, "program_exit") as program_exit:  # (the real one quits the application)
+            window = MainWindow(root)
+            root.tk.call("::tk::mac::Quit")
+        program_exit.assert_called_once_with()
+        window.graph.stop_thread(timeout=10)
+    finally:
+        root.destroy()
+
