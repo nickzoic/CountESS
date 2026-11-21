@@ -35,7 +35,7 @@ class DataTablePlugin(DuckdbInputPlugin):
 
         # XXX should deal with duplicate column names more generally
         for num, col in enumerate(self.columns):
-            if col.name == "":
+            if not col.name:
                 col.name = f"col_{num+1}"
 
         self.params["rows"] = self.rows = ArrayParam(

@@ -153,7 +153,7 @@ class SaveCsvOrderParameter(TabularMultiParam):
     descending = BooleanParam("Descending")
 
 
-def write_to_csv(source: DuckDBPyRelation, filename: str, sep: str, quoting: int) -> None:
+def write_to_csv(source: DuckDBPyRelation, filename: str, sep: str, quoting: int, header: bool = True) -> None:
     logger.debug("writing file %s", filename)
 
     def _write(fh: TextIOBase | gzip.GzipFile | bz2.BZ2File | lzma.LZMAFile, **kwargs):
@@ -162,7 +162,7 @@ def write_to_csv(source: DuckDBPyRelation, filename: str, sep: str, quoting: int
         #     path_or_buf: str | PathLike[str] | WriteBuffer[bytes] | WriteBuffer[str]
         # but bz2.BZFile|lzma.LZMAFile don't seem to be compatible.
         chunk = source.fetch_df_chunk()
-        chunk.to_csv(fh, header=True, index=False, **kwargs)  # type: ignore
+        chunk.to_csv(fh, header=header, index=False, **kwargs)  # type: ignore
         while len(chunk) > 0:
             chunk = source.fetch_df_chunk()
             chunk.to_csv(fh, header=False, index=False, **kwargs)  # type: ignore
@@ -187,9 +187,9 @@ def write_to_csv(source: DuckDBPyRelation, filename: str, sep: str, quoting: int
                 _write(fh_open, sep=sep, quoting=quoting)
     elif quoting == csv.QUOTE_ALL:
         # otherwise write it directly
-        source.to_csv(filename, sep=sep, quoting=quoting)
+        source.to_csv(filename, sep=sep, quoting=quoting, header=header)
     else:
-        source.to_csv(filename, sep=sep)
+        source.to_csv(filename, sep=sep, header=header)
 
 
 class SaveCsvPlugin(DuckdbSaveFilePlugin):
@@ -208,7 +208,7 @@ class SaveCsvPlugin(DuckdbSaveFilePlugin):
     filehandle: Optional[Union[BufferedWriter, BytesIO, gzip.GzipFile, bz2.BZ2File]] = None
     csv_columns = None
 
-    SEPARATORS = {",": ",", ";": ";", "SPACE": " ", "TAB": "\t"}
+    SEPARATORS = {",": ",", ";": ";", "|": "|", "SPACE": " ", "TAB": "\t"}
     QUOTING = {False: csv.QUOTE_MINIMAL, True: csv.QUOTE_NONNUMERIC}
 
     show_preview = False
@@ -229,5 +229,9 @@ class SaveCsvPlugin(DuckdbSaveFilePlugin):
         filename = self.filename.get_file_path()
         Path(filename).parent.mkdir(parents=True, exist_ok=True)
         write_to_csv(
-            source, filename, sep=self.SEPARATORS[self.delimiter.value], quoting=self.QUOTING[self.quoting.value]
+            source,
+            filename,
+            sep=self.SEPARATORS[self.delimiter.value],
+            quoting=self.QUOTING[self.quoting.value],
+            header=bool(self.header),
         )

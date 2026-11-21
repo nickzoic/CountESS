@@ -60,10 +60,10 @@ class GroupByPlugin(DuckdbSqlPlugin):
             if group_by:
                 return (
                     f"SELECT * FROM {table_name} JOIN (SELECT {group_by}, {columns} "
-                    "FROM {table_name} GROUP BY {group_by}) USING ({group_by})"
+                    f"FROM {table_name} GROUP BY {group_by}) USING ({group_by})"
                 )
             else:
-                return "SELECT * FROM {table_name} CROSS JOIN (SELECT {columns} " "FROM {table_name}"
+                return f"SELECT * FROM {table_name} CROSS JOIN (SELECT {columns} FROM {table_name})"
         else:
             if group_by:
                 return f"SELECT {group_by}, {columns} FROM {table_name} GROUP BY {group_by}"

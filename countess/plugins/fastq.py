@@ -36,14 +36,14 @@ class LoadFastqPlugin(DuckdbLoadFileWithTheLotPlugin):
         logger.debug("Loading file %s row_limit %s", filename, row_limit)
 
         fields = ["sequence"]
-        if self.min_avg_quality:
+        if self.min_avg_quality > 0 or self.min_low_quality > 0:
             fields.append("quality")
         if self.header_column:
             fields.append("name")
 
         if filename.endswith(".xz"):
             reader = oxbow.from_fastq(lambda: lzma.open(filename), None, fields=fields)
-        if filename.endswith(".bz2"):
+        elif filename.endswith(".bz2"):
             reader = oxbow.from_fastq(lambda: bz2.open(filename), None, fields=fields)
         else:
             reader = oxbow.from_fastq(filename, fields=fields)
@@ -53,11 +53,11 @@ class LoadFastqPlugin(DuckdbLoadFileWithTheLotPlugin):
         if row_limit:
             rel = rel.limit(row_limit)
 
-        if self.min_avg_quality:
+        if self.min_avg_quality > 0:
             filt = "list_avg(list_transform(split(quality,''), lambda x: ord(x))) >= %d" % (self.min_avg_quality + 33)
             rel = rel.filter(filt)
 
-        if self.min_low_quality:
+        if self.min_low_quality > 0:
             filt = "list_min(list_transform(split(quality,''), lambda x: ord(x))) >= %d" % (self.min_low_quality + 33)
             rel = rel.filter(filt)
 
@@ -96,7 +96,7 @@ class LoadFastaPlugin(DuckdbLoadFileWithTheLotPlugin):
     ) -> duckdb.DuckDBPyRelation:
         if filename.endswith(".xz"):
             reader = oxbow.from_fasta(lambda: lzma.open(filename))
-        if filename.endswith(".bz2"):
+        elif filename.endswith(".bz2"):
             reader = oxbow.from_fasta(lambda: bz2.open(filename))
         else:
             reader = oxbow.from_fasta(filename)
