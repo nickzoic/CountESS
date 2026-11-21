@@ -4,6 +4,7 @@ import secrets
 import threading
 import time
 import traceback
+from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, Optional
 
@@ -217,6 +218,27 @@ class PipelineNode:
                 child_node.parent_nodes.discard(self)
 
 
+@dataclass
+class NodeProgress:
+    """How far a node which is being calculated has got"""
+
+    node: PipelineNode
+    # a percentage, or None if it's running but DuckDB can't say how far it's got (yet)
+    percent: Optional[float]
+
+
+@dataclass
+class GraphProgress:
+    """What the background worker is up to, see PipelineGraph.get_progress()"""
+
+    running: list[NodeProgress]
+    waiting: int  # how many more nodes are waiting their turn
+
+    @property
+    def active(self) -> bool:
+        return bool(self.running or self.waiting)
+
+
 class PipelineGraph:
     def __init__(self, nodes: Optional[list[PipelineNode]] = None, preview_row_limit: int = 1000000):
         self.plugin_classes = get_plugin_classes()
@@ -378,29 +400,34 @@ class PipelineGraph:
             except duckdb.Error:
                 pass
 
-    def progress(self) -> bool:
-        still_working = False
-        working = self._worker_running
-        for node in self.traverse_nodes():
-            if working and node.status == PipelineNodeStatus.DIRTY:
-                logger.info("%s: 0%%", node.name)
-                still_working = True
-            elif working and node.status == PipelineNodeStatus.WORKING:
-                qp = 0
-                if isinstance(node.plugin, DuckdbPlugin):
-                    try:
-                        qp = node.plugin.query_progress(self.thread_cursor)
-                    except duckdb.Error:
-                        qp = 0
-                if qp > 0:
-                    logger.info("%s: %d%%", node.name, qp)
-                else:
-                    logger.info("%s: 0/0", node.name)
-                still_working = True
-            else:
-                logger.info("%s: 100%%", node.name)
+    def get_progress(self) -> GraphProgress:
+        """What the worker is up to: the node it is running, with how far through its
+        query it has got, and how many others are waiting.  Safe to call from any thread
+        and cheap enough to call a few times a second to drive a progress bar."""
+        running: list[NodeProgress] = []
+        waiting = 0
+        if not self._worker_running:
+            return GraphProgress(running, waiting)
 
-        return still_working
+        for node in self.traverse_nodes():
+            if node.status == PipelineNodeStatus.WORKING:
+                running.append(NodeProgress(node, self._query_percent(node)))
+            elif node.status == PipelineNodeStatus.DIRTY and isinstance(node.plugin, DuckdbPlugin):
+                waiting += 1
+        return GraphProgress(running, waiting)
+
+    def _query_percent(self, node: PipelineNode) -> Optional[float]:
+        # The worker's cursor is only ever running the current node's query.
+        # DuckDB lets another thread ask how far a query has got.
+        if node is not self._current_node or not isinstance(node.plugin, DuckdbPlugin):
+            return None
+        try:
+            percent = node.plugin.query_progress(self.thread_cursor)
+        except duckdb.Error:
+            return None
+        # DuckDB says -1 when it doesn't know: before the query starts, between one
+        # query and the next, and when the node has just finished.
+        return float(percent) if percent is not None and 0 <= percent <= 100 else None
 
     def _thread_target(self):
         """Worker: sweep for dirty nodes and update their results, until

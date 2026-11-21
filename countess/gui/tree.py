@@ -601,10 +601,6 @@ class GraphWrapper:
             node.mark_dirty()
             self.graph.update()
 
-    def poll_progress(self):
-        if self.graph.progress():
-            self.canvas.after(250, self.poll_progress)
-
     def destroy(self):
         for node_lines in self.lines.values():
             for line in node_lines.values():
