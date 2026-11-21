@@ -44,6 +44,108 @@ class ColumnsMultiParam(MultiParam):
 CSV_DELIMITER_CHOICES: dict[str, str] = {",": ",", ";": ";", "|": "|", "TAB": "\t", "SPACE": " "}
 
 
+# How the types a column of a CSV file can be given are loaded:
+#
+# * INTEGER is a 64 bit integer.  (DuckDB's INTEGER is only 32 bit, which would silently turn anything larger
+#   than 2,147,483,647 into a NULL.)
+#
+# * FLOAT is a DECIMAL, so that the numbers are exactly what was in the file: DuckDB's FLOAT is only single
+#   precision, and a DOUBLE rounds, say, 0.1 to the nearest number a binary fraction can make.  A DECIMAL has to
+#   have a fixed number of digits though, and one with a lot of them can't be multiplied (DECIMAL(38,18) times
+#   itself is an overflow error, whatever's in it), so what's used is the smallest one which holds every number
+#   which is in the column: see csv_decimal_sizes.
+
+CSV_INTEGER_TYPE = "BIGINT"
+
+# The most digits a DuckDB DECIMAL can have
+DECIMAL_MAX_DIGITS = 38
+
+
+def _decimal_digits_sql(identifier: str) -> Tuple[str, str]:
+    """Returns SQL for how many digits before the decimal point and how many after it are needed to hold a
+    value of the text column `identifier` exactly: NULL if it isn't a finite number.  It's allowed to be a bit
+    too generous (it counts a sign, and zeros at the ends) but never too small.
+
+    Most numbers are just digits and a point, which is looked at with plain string functions, much quicker
+    than the regular expressions which are needed to follow an exponent, as in 1.5e-3, moving the point."""
+    has_point = f"instr({identifier}, '.') > 0"
+    has_exponent = f"(contains({identifier}, 'e') OR contains({identifier}, 'E'))"
+    sign = f"(CASE WHEN {identifier}[1] IN ('-', '+') THEN 1 ELSE 0 END)"
+    plain_before = f"(CASE WHEN {has_point} THEN instr({identifier}, '.') - 1 ELSE length({identifier}) END) - {sign}"
+    plain_after = f"(CASE WHEN {has_point} THEN length({identifier}) - instr({identifier}, '.') ELSE 0 END)"
+
+    text = f"trim({identifier})"
+    before = f"length(ltrim(regexp_extract({text}, '^[+-]?(\\d*)', 1), '0'))"
+    after = f"length(rtrim(regexp_extract({text}, '^[+-]?\\d*\\.?(\\d*)', 1), '0'))"
+    exponent = f"coalesce(try_cast(regexp_extract({text}, '[eE]([+-]?\\d+)$', 1) as integer), 0)"
+
+    is_finite = f"try_cast({identifier} as double) is not null and isfinite(try_cast({identifier} as double))"
+    return (
+        f"CASE WHEN {is_finite} THEN greatest(0, CASE WHEN {has_exponent} THEN {before} + {exponent} "
+        f"ELSE {plain_before} END) END",
+        f"CASE WHEN {is_finite} THEN greatest(0, CASE WHEN {has_exponent} THEN {after} - {exponent} "
+        f"ELSE {plain_after} END) END",
+    )
+
+
+def csv_decimal_sizes(rel: DuckDBPyRelation, columns: Sequence[str]) -> dict[str, Optional[Tuple[int, int]]]:
+    """For each of the named text columns of `rel`, the `(width, scale)` of the smallest DECIMAL which holds
+    every number in it exactly, or None if there's one which is too big to be a DECIMAL at all (in which case
+    it has to be a DOUBLE).  This reads all of `rel` once.  If there's nothing in a column which is a number
+    its size doesn't matter, so it's the smallest there is."""
+    if not columns:
+        return {}
+    aggregates = []
+    for number, column in enumerate(columns):
+        before, after = _decimal_digits_sql(duckdb_escape_identifier(column))
+        aggregates += [f"max({before}) AS before_{number}", f"max({after}) AS after_{number}"]
+    row = rel.aggregate(", ".join(aggregates)).fetchone()
+    assert row is not None
+
+    sizes: dict[str, Optional[Tuple[int, int]]] = {}
+    for number, column in enumerate(columns):
+        before, after = row[2 * number], row[2 * number + 1]
+        if before is None or after is None:
+            sizes[column] = (1, 0)
+            continue
+        before = max(before, 1)  # (there's always a digit before the point, even if it's a 0)
+        if before > DECIMAL_MAX_DIGITS:
+            logger.warning("Column %s has numbers too big to be a DECIMAL, loading it as a DOUBLE", column)
+            sizes[column] = None
+            continue
+        if before + after > DECIMAL_MAX_DIGITS:
+            logger.warning(
+                "Column %s has numbers with more than %d digits, rounding them to fit", column, DECIMAL_MAX_DIGITS
+            )
+            after = DECIMAL_MAX_DIGITS - before
+        sizes[column] = (before + after, after)
+    return sizes
+
+
+def csv_cast_sql(value_sql: str, choice: str, size: Optional[Tuple[int, int]] = None, decimal: bool = False) -> str:
+    """The SQL for turning the text `value_sql` into what `choice` (INTEGER, FLOAT, STRING, BOOLEAN) of the
+    types of a column means.  If `decimal`, a FLOAT is a DECIMAL of `size` (width, scale), or a DOUBLE if that's
+    None."""
+    if choice == "INTEGER":
+        return f"TRY_CAST({value_sql} as {CSV_INTEGER_TYPE})"
+    if choice == "FLOAT" and decimal:
+        if size is None:
+            return f"TRY_CAST({value_sql} as DOUBLE)"
+        width, scale = size
+        direct = f"TRY_CAST({value_sql} as DECIMAL({width},{scale}))"
+        # DuckDB has trouble getting a number with an exponent (1.5e-3) into a DECIMAL of just the right size
+        # (it needs room for all the digits of the part before the exponent as well, and without it the
+        # number is a NULL, which in a test was one in ten of them), so those are put in a wide DECIMAL of the
+        # same scale first.  That's much slower, hence only for the ones which have an exponent.
+        via_wide = (
+            f"TRY_CAST(TRY_CAST({value_sql} as DECIMAL({DECIMAL_MAX_DIGITS},{scale})) as DECIMAL({width},{scale}))"
+        )
+        if value_sql == "NULL":
+            return direct
+        return f"CASE WHEN contains({value_sql}, 'e') OR contains({value_sql}, 'E') THEN {via_wide} ELSE {direct} END"
+    return f"TRY_CAST({value_sql} as {choice})"
+
+
 class ReadCsvOptions(TypedDict):
     sep: str
     null_padding: bool
@@ -66,6 +168,16 @@ class LoadCsvPlugin(DuckdbLoadFileWithTheLotPlugin):
     header = BooleanParam("CSV file has header row?", True)
     columns = ArrayParam("Columns", ColumnsMultiParam("Column"))
 
+    @staticmethod
+    def _read_once(
+        cursor: duckdb.DuckDBPyConnection, rel: duckdb.DuckDBPyRelation, row_limit: Optional[int]
+    ) -> duckdb.DuckDBPyRelation:
+        """What's read from a file object (as for the compressed files) can only be read the once, and has to
+        be before the file is closed, so it goes straight into a table, which can be looked at as often as needed."""
+        if row_limit is not None:
+            rel = rel.limit(row_limit)
+        return duckdb_source_to_table(cursor, rel)
+
     def load_file(
         self, cursor: duckdb.DuckDBPyConnection, filename: str, file_param: BaseParam, row_limit: Optional[int] = None
     ) -> duckdb.DuckDBPyRelation:
@@ -79,15 +191,14 @@ class LoadCsvPlugin(DuckdbLoadFileWithTheLotPlugin):
         }
         if filename.endswith(".bz2"):
             with bz2.open(filename) as fh:
-                rel = cursor.read_csv(fh, **options)  # typing: disable=arg-type
+                rel = self._read_once(cursor, cursor.read_csv(fh, **options), row_limit)  # typing: disable=arg-type
         elif filename.endswith(".xz"):
             with lzma.open(filename) as fh:
-                rel = cursor.read_csv(fh, **options)  # typing: disable=arg-type
+                rel = self._read_once(cursor, cursor.read_csv(fh, **options), row_limit)  # typing: disable=arg-type
         else:
             rel = cursor.read_csv(filename, **options)  # typing: disable=arg-type
-
-        if row_limit is not None:
-            rel = rel.limit(row_limit)
+            if row_limit is not None:
+                rel = rel.limit(row_limit)
 
         if len(self.columns):
             # If there's a bonus filename column ignore it for now
@@ -95,25 +206,35 @@ class LoadCsvPlugin(DuckdbLoadFileWithTheLotPlugin):
             # there's three cases here, either we've got both a column
             # name or a column parameter or both, depending on the relative
             # lengths of the column lists.
+            pairs = list(zip_longest(rel_columns, self.columns))
+
+            # FLOAT columns are as big a DECIMAL as the numbers in them need, which means looking at them first
+            float_columns = [cn for cn, cp in pairs if cn is not None and cp is not None and cp.type.value == "FLOAT"]
+            sizes = csv_decimal_sizes(rel, float_columns)
+
             proj = ",".join(
-                duckdb_escape_identifier(cn)
-                if cp is None
-                else (
-                    (
-                        f"TRY_CAST(NULL as {cp.type.value})"
-                        if cn is None
-                        else f"TRY_CAST({duckdb_escape_identifier(cn)} as {cp.type.value})"
+                (
+                    duckdb_escape_identifier(cn)
+                    if cp is None
+                    else (
+                        csv_cast_sql(
+                            "NULL" if cn is None else duckdb_escape_identifier(cn),
+                            cp.type.value,
+                            sizes.get(cn, (1, 0)) if cn is not None else (1, 0),
+                            decimal=True,
+                        )
+                        + " AS "
+                        + (duckdb_escape_identifier(cp.name.value) if cp.name.value else "column%d" % num)
                     )
-                    + " AS "
-                    + (duckdb_escape_identifier(cp.name.value) if cp.name.value else "column%d" % num)
                 )
-                for num, (cn, cp) in enumerate(zip_longest(rel_columns, self.columns))
+                for num, (cn, cp) in enumerate(pairs)
                 if cp is None or cp.type.is_not_none()
             )
 
             logger.debug("LoadCsvPlugin.load_file proj %s", proj)
             rel = rel.project(proj)
 
+        # (see _read_once for why it's done there now, for the files which need it)
         # `rel = cursor.read_csv(fh)` returns a `DuckDBPyRelation`
         # with `rel.alias` starting `DUCKDB_INTERNAL_OBJECTSTORE:`
         # but limits / projections / views of that relation stop
