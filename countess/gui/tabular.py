@@ -11,12 +11,8 @@ import duckdb
 from duckdb import DuckDBPyConnection, DuckDBPyRelation
 
 from countess.gui.widgets import ResizingFrame, copy_to_clipboard, get_icon
-from countess.utils.duckdb import (
-    duckdb_dtype_is_integer,
-    duckdb_dtype_is_numeric,
-    duckdb_dtype_to_datatype_choice,
-    duckdb_escape_identifier,
-)
+from countess.utils.duckdb import duckdb_dtype_is_integer, duckdb_dtype_is_numeric, duckdb_dtype_to_datatype_choice
+from countess.utils.sql import Id, Raw, Sql, join
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +28,14 @@ def column_format_for(table: DuckDBPyRelation, column: str) -> str:
 
     # XXX https://github.com/duckdb/duckdb/issues/15267
     # dtype = table[column].dtypes[0]
-    dtype = table.project(duckdb_escape_identifier(column)).dtypes[0]
+    dtype = table.project(str(Id(column))).dtypes[0]
 
     if duckdb_dtype_is_numeric(dtype):
         # Work out the maximum width required to represent the integer part in this
         # column, so we can pad values to that width.
-        column_esc = duckdb_escape_identifier(column)
-        column_min_max = table.aggregate(f"min({column_esc}), max({column_esc})").fetchone()
+        column_min_max = table.aggregate(
+            str(Sql.template("min({column}), max({column})", column=Id(column)))
+        ).fetchone()
         if column_min_max is None:
             return "%s"
         column_min, column_max = column_min_max
@@ -251,9 +248,7 @@ class TabularDataFrame(tk.Frame):
         # for a stable sort order.
 
         column_name = self.table.columns[column_num]
-        escaped_column_names = [
-            duckdb_escape_identifier(c) for c in [column_name] + [c for c in self.table.columns if c != column_name]
-        ]
+        sort_names = [column_name] + [c for c in self.table.columns if c != column_name]
 
         # There used to be a CREATE INDEX here, run on the GUI thread, but DuckDB's
         # ART indexes aren't used to satisfy ORDER BY ... LIMIT (it was measured at
@@ -262,7 +257,9 @@ class TabularDataFrame(tk.Frame):
         # thread which is dropping and recreating it.  So just sort on demand.
 
         direction = "ASC" if self.sort_ascending else "DESC"
-        self.table_order = ",".join(f"{c} {direction}" for c in escaped_column_names)
+        self.table_order = str(
+            join(Sql.template("{column} {direction}", column=Id(c), direction=Raw(direction)) for c in sort_names)
+        )
 
         logger.debug("TabularDataFrame set_sort_order %s %s", column_name, self.table_order)
 

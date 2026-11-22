@@ -125,9 +125,12 @@ def test_things_which_cant_be_values_are_refused_where_they_are_made(value, erro
         Lit(value)
 
 
-def test_literals_as_they_have_always_been_written():
-    """Everything which used to work gives what it did before, so it can be put in its place."""
-    from countess.utils.duckdb import duckdb_escape_literal  # pylint: disable=import-outside-toplevel
+def test_the_old_functions_are_these_ones_and_so_get_what_they_do():
+    """(The exact text which each gives is in tests/test_duckdb.py.)"""
+    from countess.utils.duckdb import (
+        duckdb_escape_identifier,
+        duckdb_escape_literal,
+    )  # pylint: disable=import-outside-toplevel
 
     for value in [
         "x",
@@ -135,15 +138,20 @@ def test_literals_as_they_have_always_been_written():
         5,
         -5,
         1.5,
-        -2.5e-7,
+        float("nan"),
+        float("-inf"),
         True,
-        False,
         None,
         [1, 2],
         decimal.Decimal("1.50"),
-        decimal.Decimal("0.005"),
+        np.int64(5),
     ]:
-        assert str(Lit(value)) == duckdb_escape_literal(value), value
+        assert duckdb_escape_literal(value) == str(Lit(value)), value
+    for name in ["x", 'q"uote', "a b"]:
+        assert duckdb_escape_identifier(name) == str(Id(name))
+    assert duckdb_escape_identifier(None) is None  # (as it always did: an Id doesn't)
+    with pytest.raises(SqlError):
+        duckdb_escape_identifier("")
 
 
 # ---- functions and types
