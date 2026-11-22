@@ -57,12 +57,11 @@ def test_an_empty_source_is_still_a_source(ddbc):
     assert result.fetchall() == []
 
 
-def test_joining_runs_each_source_once_and_not_more_for_the_sake_of_log_messages(ddbc):
-    """(A join does run once to find out if the join can be made at all, but that's all.)"""
+def test_joining_doesnt_run_its_sources(ddbc):
+    """(What a join needs to know about its sources to be sure it can be made is in their types.)"""
     left, left_calls = make_expensive_relation(ddbc, "left")
     right, right_calls = make_expensive_relation(ddbc, "right")
     plugin = JoinPlugin()
     result = plugin.execute_multi(ddbc, {"left": left, "right": right})
     assert result is not None
-    assert len(left_calls) == 50
-    assert len(right_calls) == 50
+    assert not left_calls and not right_calls

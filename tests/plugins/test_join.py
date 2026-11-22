@@ -1,3 +1,5 @@
+import datetime
+
 import duckdb
 import numpy as np
 import pandas as pd
@@ -5,7 +7,7 @@ import pytest
 
 ddbc = duckdb.connect()
 
-from countess.plugins.join import JoinPlugin
+from countess.plugins.join import JoinPlugin, JoinTypeError
 
 ddbc.from_df(
     pd.DataFrame(
@@ -254,9 +256,127 @@ def test_nothing_to_join(join_ddbc):
     assert plugin.execute_multi(join_ddbc, {"a": join_ddbc.table("a"), "b": None}) is None
 
 
-def test_a_join_between_things_which_cant_be_compared_gives_nothing(join_ddbc, caplog):
-    join_ddbc.sql("create table words as select * from (values ('abc', 1), ('2', 2)) v(k1, vw)")
-    with caplog.at_level(logging.INFO):
-        _, output = run_join(join_ddbc, ["a", "words"], {"0.join_on": "k1", "1.join_on": "k1"})
-    assert output is None  # (a number can be compared with '2' but not with 'abc')
-    assert "abc" in caplog.text
+# ---- the types of the join columns are sorted out up front, so there's no need to run the join to see if it works
+
+
+def join_query(join_ddbc, caplog, tables, settings):
+    """Run a join and also return the query it made, from its debug logging"""
+    with caplog.at_level(logging.DEBUG):
+        _, output = run_join(join_ddbc, tables, settings)
+    queries = [r.getMessage() for r in caplog.records if "execute_multi query" in r.getMessage()]
+    return output, queries[-1]
+
+
+def test_columns_of_the_same_type_are_compared_as_they_are(join_ddbc, caplog):
+    output, query = join_query(join_ddbc, caplog, ["a", "b"], {"0.join_on": "k1", "1.join_on": "j1"})
+    assert output is not None
+    assert "CAST" not in query
+
+
+@pytest.mark.parametrize(
+    "other_type", ["BIGINT", "SMALLINT", "UTINYINT", "HUGEINT", "FLOAT", "DOUBLE", "DECIMAL(18,3)"]
+)
+def test_numbers_of_different_types_are_compared_as_numbers(join_ddbc, other_type):
+    join_ddbc.sql(
+        f"create table nums as select * from (values (1::{other_type}, 'one'), (3::{other_type}, 'three')) v(n, w)"
+    )
+    _, output = run_join(join_ddbc, ["a", "nums"], {"0.join_on": "k1", "1.join_on": "n"})
+    assert sorted((row[0], row[-1]) for row in output.fetchall()) == [(1, "one"), (3, "three")]
+
+
+def test_a_date_and_a_timestamp_are_compared_as_timestamps(join_ddbc, caplog):
+    join_ddbc.sql(
+        "create table days as select * from (values (DATE '2024-01-02', 'a'), (DATE '2024-01-03', 'b')) v(d, da)"
+    )
+    join_ddbc.sql(
+        "create table moments as select * from (values (TIMESTAMP '2024-01-02 00:00:00', 'x'),"
+        " (TIMESTAMP '2024-01-03 12:00:00', 'y')) v(t, tx)"
+    )
+    output, query = join_query(join_ddbc, caplog, ["days", "moments"], {"0.join_on": "d", "1.join_on": "t"})
+    assert "CAST" in query
+    # (only the first matches: the second is at midday)
+    assert output.fetchall() == [
+        (datetime.date(2024, 1, 2), "a", datetime.datetime(2024, 1, 2, 0, 0), "x"),
+    ]
+
+
+def test_text_is_read_as_a_number_to_compare_it_with_a_number(join_ddbc):
+    """Text '2' or '02' is the number 2, and text which isn't a number matches nothing, as opposed to stopping
+    the join with an error."""
+    join_ddbc.sql("create table words as select * from (values ('abc', 1), ('02', 2), ('3', 3)) v(k1, vw)")
+    _, output = run_join(join_ddbc, ["a", "words"], {"0.join_on": "k1", "1.join_on": "k1"})
+    assert sorted(output.fetchall()) == [(2, "y", 20, 2), (3, "z", 30, 3)]
+
+
+def test_text_is_read_as_a_number_whichever_way_round(join_ddbc):
+    join_ddbc.sql("create table words as select * from (values ('abc', 1), ('02', 2), ('3', 3)) v(k1, vw)")
+    _, output = run_join(join_ddbc, ["words", "a"], {"0.join_on": "k1", "1.join_on": "k1"})
+    assert sorted(output.fetchall()) == [("02", 2, "y", 20), ("3", 3, "z", 30)]
+
+
+def test_text_is_read_as_a_date_to_compare_it_with_a_date(join_ddbc):
+    join_ddbc.sql(
+        "create table days as select * from (values (DATE '2024-01-02', 'a'), (DATE '2024-01-03', 'b')) v(d, da)"
+    )
+    join_ddbc.sql("create table words as select * from (values ('2024-01-03', 'x'), ('not a date', 'y')) v(w, wx)")
+    _, output = run_join(join_ddbc, ["days", "words"], {"0.join_on": "d", "1.join_on": "w"})
+    assert output.fetchall() == [(datetime.date(2024, 1, 3), "b", "2024-01-03", "x")]
+
+
+def test_a_join_which_cant_be_made_is_found_out_without_running_anything(join_ddbc):
+    calls = []
+
+    def counted(i: int) -> int:
+        calls.append(i)
+        return i
+
+    join_ddbc.create_function("counted", counted)
+    join_ddbc.sql("create table dates as select DATE '2024-01-02' as d")
+    join_ddbc.sql("select counted(k1) as k1 from a").to_view("counted_a")
+    with pytest.raises(JoinTypeError):
+        run_join(join_ddbc, ["counted_a", "dates"], {"0.join_on": "k1", "1.join_on": "d"})
+    assert not calls
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        "DATE '2024-01-02'",  # (a number isn't a date)
+        "{'x': 1}",
+        "[1]",
+        "MAP {'x': 1}",
+    ],
+)
+def test_a_number_cant_be_compared_with_these(join_ddbc, other):
+    join_ddbc.sql(f"create table odd as select {other} as o")
+    with pytest.raises(JoinTypeError) as excinfo:
+        run_join(join_ddbc, ["a", "odd"], {"0.join_on": "k1", "1.join_on": "o"})
+    message = str(excinfo.value)
+    assert "a.k1" in message and "odd.o" in message and "INTEGER" in message
+
+
+@pytest.mark.parametrize("other", ["[1]", "{'x': 1}", "MAP {'x': 1}"])
+def test_text_cant_be_compared_with_nested_types(join_ddbc, other):
+    join_ddbc.sql(f"create table odd as select {other} as o")
+    with pytest.raises(JoinTypeError) as excinfo:
+        run_join(join_ddbc, ["a", "odd"], {"0.join_on": "k2", "1.join_on": "o"})
+    assert "VARCHAR" in str(excinfo.value)
+
+
+def test_every_pair_of_join_columns_is_checked(join_ddbc):
+    """The first columns can be fine and the second ones not, and it's the second ones which are named"""
+    join_ddbc.sql("create table odd as select 1 as j1, DATE '2024-01-02' as j2")
+    with pytest.raises(JoinTypeError) as excinfo:
+        run_join(
+            join_ddbc,
+            ["a", "odd"],
+            {"0.join_on": "k1", "1.join_on": "j1", "0.join_2": "k1", "1.join_2": "j2"},
+        )
+    assert "odd.j2" in str(excinfo.value)
+
+
+def test_every_table_is_checked_against_the_first(join_ddbc):
+    join_ddbc.sql("create table odd as select [1] as o")
+    with pytest.raises(JoinTypeError) as excinfo:
+        run_join(join_ddbc, ["a", "b", "odd"], {"0.join_on": "k1", "1.join_on": "j1", "2.join_on": "o"})
+    assert "odd.o" in str(excinfo.value)
