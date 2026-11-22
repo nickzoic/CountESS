@@ -154,14 +154,14 @@ class DuckdbSimplePlugin(DuckdbPlugin):
         self.prepare(ddbc, self.combined_source(ddbc, sources))
 
     def prepare(self, ddbc: DuckDBPyConnection, source: Optional[DuckDBPyRelation]) -> None:
-        if source:
+        if source is not None:
             self.set_column_choices_from_duckdb(source)
 
     def execute_multi(
         self, ddbc: DuckDBPyConnection, sources: Mapping[str, DuckDBPyRelation], row_limit: Optional[int] = None
     ) -> Optional[DuckDBPyRelation]:
         sc = self.combined_source(ddbc, sources)
-        if sc:
+        if sc is not None:
             return self.execute(ddbc, sc, row_limit)
         else:
             return None

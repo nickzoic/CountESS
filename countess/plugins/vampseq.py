@@ -34,7 +34,7 @@ class VampSeqScorePlugin(DuckdbSqlPlugin):
                 c.weight.value = (n + 1) / len(count_cols)
 
         weight_cols = set(n for n, p in self.columns.get_column_params() if p.weight.value is not None)
-        if source:
+        if source is not None:
             self.group_by.set_choices([c for c in source.columns if c not in weight_cols])
 
     def sql(self, table_name: str, columns: Iterable[str]) -> Optional[str]:

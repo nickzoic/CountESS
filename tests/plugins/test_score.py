@@ -4,7 +4,7 @@ import duckdb
 import numpy as np
 import pytest
 
-from countess.plugins.score import ScoringPlugin, score_function
+from countess.plugins.score import ScoringPlugin, _wls_slope, _wls_statsmodels, score_function
 
 
 def wls_slope(times, counts, populations):
@@ -50,6 +50,41 @@ def test_two_time_points_ignores_what_the_times_are():
 )
 def test_three_or_more_time_points(times, counts, populations):
     assert score_function(times, counts, populations) == pytest.approx(wls_slope(times, counts, populations), rel=1e-9)
+
+
+def _wls_inputs(times, counts, populations):
+    ys = [math.log((c + 0.5) / (p + 0.5)) for c, p in zip(counts, populations)]
+    ws = [1 / (1 / (c + 0.5) + 1 / (p + 0.5)) for c, p in zip(counts, populations)]
+    return times, ys, ws
+
+
+def test_closed_form_agrees_with_statsmodels_on_random_data():
+    """`_wls_slope` is a replacement for a statsmodels WLS fit, so check them against each other."""
+    rng = np.random.default_rng(1)
+    for _ in range(300):
+        n = int(rng.integers(3, 13))
+        times = sorted(rng.uniform(0, 1, n))
+        populations = rng.integers(1, 2_000_000, n)
+        counts = np.minimum(populations, rng.poisson(rng.uniform(0, 50), n))
+        args = _wls_inputs(times, [int(c) for c in counts], [int(p) for p in populations])
+        assert _wls_slope(*args) == pytest.approx(_wls_statsmodels(*args), rel=1e-8, abs=1e-12)
+
+
+def test_closed_form_is_accurate_when_the_times_are_large_compared_to_their_spread():
+    times = [1e6 + i for i in range(5)]
+    args = _wls_inputs(times, [3, 8, 20, 41, 90], [1000] * 5)
+    assert _wls_slope(*args) == pytest.approx(_wls_statsmodels(*args), rel=1e-8)
+
+
+def test_closed_form_with_extreme_weights():
+    args = _wls_inputs([0.0, 0.25, 0.5, 0.75, 1.0], [0, 0, 0, 1, 0], [10**9] * 5)
+    assert _wls_slope(*args) == pytest.approx(_wls_statsmodels(*args), rel=1e-8)
+
+
+def test_identical_times_have_no_slope_of_their_own_so_it_is_left_to_statsmodels():
+    args = _wls_inputs([1.0, 1.0, 1.0], [1, 5, 9], [100, 100, 100])
+    assert _wls_slope(*args) == pytest.approx(_wls_statsmodels(*args))
+    assert score_function([1.0, 1.0, 1.0], [1, 5, 9], [100, 100, 100]) == pytest.approx(_wls_statsmodels(*args))
 
 
 def test_a_variant_which_gets_more_common_scores_positive_and_one_which_dies_out_negative():

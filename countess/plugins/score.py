@@ -3,7 +3,6 @@ import secrets
 from math import log, sqrt
 from typing import Optional
 
-import statsmodels.api as statsmodels_api
 from duckdb import DuckDBPyConnection, DuckDBPyRelation
 from duckdb.sqltypes import DuckDBPyType
 
@@ -18,6 +17,44 @@ from countess.utils.duckdb import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _wls_statsmodels(xs: list[float], ys: list[float], ws: list[float]) -> tuple[float, float]:
+    """Slope and standard error of the slope, via statsmodels.  Only used as a fallback for degenerate
+    inputs (see `_wls_slope`) because it's about 15x slower than `_wls_slope`."""
+
+    import statsmodels.api as statsmodels_api  # pylint: disable=import-outside-toplevel
+
+    fit = statsmodels_api.WLS(ys, [[x, 1.0] for x in xs], ws).fit()
+    return fit.params[0], fit.bse[0]
+
+
+def _wls_slope(xs: list[float], ys: list[float], ws: list[float]) -> tuple[float, float]:
+    """Slope and standard error of the slope of the weighted least squares line y = slope * x + intercept.
+
+    This is the closed form of what `statsmodels.WLS(ys, [[x, 1] ...], ws).fit()` does for a straight line
+    (two parameters): centre x and y on their weighted means, then
+
+        slope = sum(w (x - xbar) (y - ybar)) / sum(w (x - xbar)^2)
+        var(slope) = (sum(w residual^2) / (n - 2)) / sum(w (x - xbar)^2)
+
+    Working from the centred values rather than the raw sums of w, wx, wxx, ... avoids catastrophic
+    cancellation when the x values are large compared to their spread.  Building and decomposing a
+    statsmodels model for every variant was the single largest cost of scoring a typical experiment.
+    """
+
+    sw = sum(ws)
+    xbar = sum(w * x for w, x in zip(ws, xs)) / sw
+    ybar = sum(w * y for w, y in zip(ws, ys)) / sw
+    sxx = sum(w * (x - xbar) ** 2 for w, x in zip(ws, xs))
+    if not sxx > 0.0:
+        # all the x values are the same: there's no unique slope.  Let statsmodels decide what to do.
+        return _wls_statsmodels(xs, ys, ws)
+    sxy = sum(w * (x - xbar) * (y - ybar) for w, x, y in zip(ws, xs, ys))
+    slope = sxy / sxx
+    intercept = ybar - slope * xbar
+    rss = sum(w * (y - slope * x - intercept) ** 2 for w, x, y in zip(ws, xs, ys))
+    return slope, sqrt(rss / (len(xs) - 2) / sxx)
 
 
 def score_function(times: list[float], counts: list[float], populations: list[float]) -> Optional[tuple[float, float]]:
@@ -45,13 +82,10 @@ def score_function(times: list[float], counts: list[float], populations: list[fl
         )
     else:
         # multi time point least squares regression
-        xs = [[t, 1.0] for t in times]
         ys = [log((c + 0.5) / (p + 0.5)) for c, p in zip(counts, populations)]
         ws = [1 / ((1 / (c + 0.5)) + (1 / (p + 0.5))) for c, p in zip(counts, populations)]
-        fit = statsmodels_api.WLS(ys, xs, ws).fit()
         # we only care about the slope, not the "intercept" of the line.
-        score = fit.params[0]
-        sigma = fit.bse[0]
+        score, sigma = _wls_slope(times, ys, ws)
 
     return score, sigma
 

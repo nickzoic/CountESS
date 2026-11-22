@@ -268,6 +268,89 @@ def test_in_a_query_with_columns_dropped(ddbc, make_source):
     assert output.columns == ["n", "variant", "protein", "class"]
 
 
+def test_each_distinct_input_is_only_called_once(ddbc, make_source, monkeypatch):
+    """The whole point of calling through a join: a sequence which turns up in many rows is only worked out once."""
+    source = make_source(
+        "select * from (values ('ATGGTTAAATAG', 1), ('ATGGCTAAATAG', 2), ('ATGGTTAAATAG', 3), ('ATGGTTAAATAG', 4),"
+        " ('ATGGCTAAATAG', 5), ('', 6)) t(seq, n)"
+    )
+    plugin = variant_plugin()
+    calls = []
+    real_call = plugin.call
+
+    def spy(sequence, reference, dna_offset, protein_offset):  # (duckdb needs to see the real parameters)
+        calls.append((sequence, reference, dna_offset, protein_offset))
+        return real_call(sequence, reference, dna_offset, protein_offset)
+
+    monkeypatch.setattr(plugin, "call", spy)
+    plugin.prepare(ddbc, source)
+    rows = plugin.execute(ddbc, source).fetchall()
+
+    assert len(rows) == 6
+    assert sorted(a[0] for a in calls) == ["ATGGCTAAATAG", "ATGGTTAAATAG"]  # (and not the empty one)
+    assert sorted(r[1:] for r in rows if r[0] == "ATGGTTAAATAG") == [(n, "g.5C>T", "p.Ala2Val", "M") for n in (1, 3, 4)]
+
+
+def test_an_upstream_which_is_a_view_is_only_evaluated_once(ddbc):
+    """The query needs the source twice (to find the distinct inputs, and to join the results back to), which
+    must not mean doing everything upstream of it twice."""
+    evaluations = []
+
+    def upstream(seq: str) -> str:
+        evaluations.append(seq)
+        return seq
+
+    ddbc.create_function("upstream", upstream)
+    ddbc.sql("create table base as select 'ATGGTTAAATAG' as seq from range(100)")
+    ddbc.sql("create view lazy as select upstream(seq) as seq from base")
+    source = ddbc.table("lazy")
+    plugin = variant_plugin()
+    plugin.prepare(ddbc, source)
+    assert len(plugin.execute(ddbc, source).fetchall()) == 100
+    assert len(evaluations) == 100
+
+
+def test_reference_and_offsets_from_columns_in_a_query(ddbc, make_source):
+    """Rows with the same sequence but a different reference or offset are different calls, and each row gets
+    exactly what calling `transform` on it would have given."""
+    values = [
+        ("ATGGTTAAATAG", REFERENCE, 0, 0),
+        ("ATGGTTAAATAG", REFERENCE, 99, 33),  # (same sequence, different offsets)
+        ("ATGGTTAAATAG", "ATGGTTAAATAG", 0, 0),  # (same sequence, different reference)
+        ("ATGGCTTAATAG", REFERENCE, 3, 1),
+        ("ATGGCTTAATAG", REFERENCE, None, None),  # (a null offset is no offset)
+        ("ATGGCTAAATAG", "", 0, 0),  # (no reference)
+    ]
+    source = make_source(
+        "select * from (values "
+        + ", ".join(f"({', '.join(duckdb_escape_literal(v) for v in row)}, {n})" for n, row in enumerate(values))
+        + ") t(seq, ref, doff, poff, n)"
+    )
+    params = {"reference": "— ref", "variant.offset": "— doff", "protein.offset": "— poff"}
+    plugin = variant_plugin(**params)
+    plugin.set_column_choices({"seq": False, "ref": False, "doff": True, "poff": True, "n": True})
+    plugin.prepare(ddbc, source)
+    output = plugin.execute(ddbc, source)
+    assert output.columns == ["seq", "ref", "doff", "poff", "n", "variant", "protein", "class"]
+
+    expected = []
+    reference_plugin = variant_plugin(**params)
+    reference_plugin.set_column_choices({"seq": False, "ref": False, "doff": True, "poff": True, "n": True})
+    for n, (seq, ref, doff, poff) in enumerate(values):
+        result = reference_plugin.transform({"seq": seq, "ref": ref, "doff": doff, "poff": poff, "n": n})
+        expected.append((None,) * 8 if result is None else tuple(result.values()))
+    assert sorted(output.fetchall(), key=repr) == sorted(expected, key=repr)
+
+
+def test_an_output_with_the_same_name_as_an_input_replaces_it_in_place(ddbc, make_source):
+    source = make_source("select * from (values ('ATGGTTAAATAG', 'x', 1)) t(seq, protein, n)")
+    plugin = variant_plugin()
+    plugin.prepare(ddbc, source)
+    output = plugin.execute(ddbc, source)
+    assert output.columns == ["seq", "protein", "n", "variant", "class"]
+    assert output.fetchall() == [("ATGGTTAAATAG", "p.Ala2Val", 1, "g.5C>T", "M")]
+
+
 @pytest.mark.xfail(
     strict=True,
     reason='the "Drop unmatched rows" option is never looked at: switching it on makes no difference to what comes out',
