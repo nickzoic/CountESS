@@ -82,6 +82,12 @@ delimiter
 quoting
 : whether to quote all string values, even if they don't appear to need it.  This can reduce the chance of data corruption with software which can otherwise confuse string values for dates or numbers.
 
+#### Preview
+
+Nothing is written while the pipeline is being set up, and as there are no rows of output to look at, the preview pane shows what the file will look like instead: the start of it, as text, with the header, delimiter, quoting and sorting which have been chosen.  It shows the first 100 rows, and a note of how many more there are.
+
+It is made by the same code which writes the file, for a file with the same ending, so it shows how everything will be written, including things which come out differently with different quoting, such as `True` and `true`, and whether an empty value is written as nothing or as `""`.
+
 ### Parquet Reader
 
 Loads data from [Apache Parquet](https://parquet.apache.org/) files.
