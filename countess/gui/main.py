@@ -41,6 +41,7 @@ from countess.gui.tree import FlippyCanvas, GraphWrapper
 from countess.gui.widgets import (
     LabeledProgressbar,
     ResizingFrame,
+    TextPreviewFrame,
     ask_open_filename,
     ask_saveas_filename,
     get_icon,
@@ -59,9 +60,7 @@ options:
     --preview LIMIT                set preview mode row limit (default: %s)
     --log LEVEL                    set log level to LEVEL
     CONFIGFILE                     load configuration file (.ini or .json)
-""" % (
-    preview_row_limit or "NONE"
-)
+""" % (preview_row_limit or "NONE")
 
 
 # import faulthandler
@@ -278,6 +277,14 @@ class ConfiguratorWrapper:
             text.insert("1.0", self.node.message or "")
             text["state"] = "disabled"
             text.grid(sticky=tk.NSEW)
+            self.frame.add_child(self.preview_subframe)
+            self._preview_generation = generation
+
+        elif self.node.status == PipelineNodeStatus.RESULT and self.node.preview_text is not None:
+            # (the plugin has no output rows to make a table of, such as one which saves a file, but it has
+            # something which can be shown in its place)
+            logger.debug("ConfiguratorWrapper.show_preview_subframe text of %s", self.node.name)
+            self.preview_subframe = TextPreviewFrame(self.frame, self.node.preview_text)
             self.frame.add_child(self.preview_subframe)
             self._preview_generation = generation
 

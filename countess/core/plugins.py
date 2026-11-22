@@ -135,6 +135,12 @@ class DuckdbPlugin(BasePlugin):
     ) -> Optional[DuckDBPyRelation]:
         raise NotImplementedError(f"{self.__class__}.execute_multi")
 
+    def preview_text_multi(self, ddbc: DuckDBPyConnection, sources: Mapping[str, DuckDBPyRelation]) -> Optional[str]:
+        """For a plugin which has no output rows to show a table of in its preview, such as one which saves a
+        file, text to show instead, or None if there's nothing to show.  It's asked for when the plugin's
+        execute_multi has made no result, in the thread which runs the nodes."""
+        return None
+
     def query_progress(self, ddbc: DuckDBPyConnection) -> float:
         """How far the query running on `ddbc` has got, as a percentage, or -1 if
         it isn't known (which is when no query is running, among other times)."""
@@ -335,6 +341,15 @@ class DuckdbSaveFilePlugin(DuckdbSimplePlugin):
 
     def execute(self, ddbc, source, row_limit: Optional[int] = None):
         raise NotImplementedError(f"{self.__class__}.execute")
+
+    def preview_text_multi(self, ddbc: DuckDBPyConnection, sources: Mapping[str, DuckDBPyRelation]) -> Optional[str]:
+        source = self.combined_source(ddbc, sources)
+        return None if source is None else self.preview_text(ddbc, source)
+
+    def preview_text(self, ddbc: DuckDBPyConnection, source: DuckDBPyRelation) -> Optional[str]:
+        """What the file would look like, or the start of it, as text to show in the preview of this plugin, which
+        has no output rows to show instead.  None (as it is unless a plugin says otherwise) is for no preview."""
+        return None
 
 
 class DuckdbTransformPlugin(DuckdbSimplePlugin):

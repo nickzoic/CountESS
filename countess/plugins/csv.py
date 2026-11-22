@@ -3,10 +3,11 @@ import csv
 import gzip
 import logging
 import lzma
+import tempfile
 from io import BufferedWriter, BytesIO, TextIOBase
 from itertools import zip_longest
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple, TypedDict, Union
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple, TypedDict, Union
 
 import duckdb
 from duckdb import DuckDBPyConnection, DuckDBPyRelation
@@ -160,6 +161,25 @@ class SaveCsvOrderParameter(TabularMultiParam):
     descending = BooleanParam("Descending")
 
 
+# how many rows of the data are shown in the preview of CSV Save, which is of what the file will look like
+CSV_PREVIEW_ROWS = 100
+
+# the ways of reading back a compressed file, by the extension which says it is one
+COMPRESSION_OPENERS: dict[str, Callable] = {".gz": gzip.open, ".bz2": bz2.open, ".xz": lzma.open}
+
+
+def csv_text(source: DuckDBPyRelation, extension: str, sep: str, quoting: int, header: bool = True) -> str:
+    """The text which `write_to_csv` writes for `source`, in a file which has this extension (which is "" or one
+    of those of COMPRESSION_OPENERS).  This has it write a file and reads it back, as which of its ways of writing
+    is used, and so exactly how things like booleans, numbers and nulls come out, depends on the extension and
+    on the quoting: a preview which did it some other way might not be what the file is."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / ("preview.csv" + extension)
+        write_to_csv(source, str(path), sep=sep, quoting=quoting, header=header)
+        with COMPRESSION_OPENERS.get(extension, open)(path, "rt", encoding="utf-8") as fh:
+            return fh.read()
+
+
 def write_to_csv(source: DuckDBPyRelation, filename: str, sep: str, quoting: int, header: bool = True) -> None:
     logger.debug("writing file %s", filename)
 
@@ -218,7 +238,35 @@ class SaveCsvPlugin(DuckdbSaveFilePlugin):
     SEPARATORS = {",": ",", ";": ";", "|": "|", "SPACE": " ", "TAB": "\t"}
     QUOTING = {False: csv.QUOTE_MINIMAL, True: csv.QUOTE_NONNUMERIC}
 
-    show_preview = False
+    def sorted(self, source: DuckDBPyRelation) -> DuckDBPyRelation:
+        """The source in the order that the file is to have it in"""
+        if len(self.sorting) == 0:
+            return source
+        order_by = join(
+            Sql.template("{column} DESC", column=Id(sp.order_by.value)) if sp.descending else Id(sp.order_by.value)
+            for sp in self.sorting
+        )
+        logger.debug("SaveCsvPlugin.sorted order_by %s", order_by)
+        return source.order(str(order_by))
+
+    def preview_text(self, ddbc: DuckDBPyConnection, source: DuckDBPyRelation) -> Optional[str]:
+        """The start of the file as it will be written, with the delimiter, quoting, header and order that it
+        has been set up to have, in place of the table of rows which something which writes a file hasn't got"""
+        total = len(source)
+        filename = self.filename.get_file_path() if self.filename else ""
+        extension = next((ext for ext in COMPRESSION_OPENERS if filename.endswith(ext)), "")
+
+        text = csv_text(
+            self.sorted(source).limit(CSV_PREVIEW_ROWS),
+            extension,
+            sep=self.SEPARATORS[self.delimiter.value],
+            quoting=self.QUOTING[self.quoting.value],
+            header=bool(self.header),
+        )
+        hidden = total - CSV_PREVIEW_ROWS
+        if hidden > 0:
+            text += f"… and {hidden:,} more {'row' if hidden == 1 else 'rows'}\n"
+        return text
 
     def execute(
         self, ddbc: DuckDBPyConnection, source: Optional[DuckDBPyRelation], row_limit: Optional[int] = None
@@ -226,13 +274,7 @@ class SaveCsvPlugin(DuckdbSaveFilePlugin):
         if source is None or row_limit is not None or not self.filename:
             return
 
-        if len(self.sorting):
-            order_by = join(
-                Sql.template("{column} DESC", column=Id(sp.order_by.value)) if sp.descending else Id(sp.order_by.value)
-                for sp in self.sorting
-            )
-            logger.debug("SaveCsvPlugin.execute order_by %s", order_by)
-            source = source.order(str(order_by))
+        source = self.sorted(source)
 
         filename = self.filename.get_file_path()
         Path(filename).parent.mkdir(parents=True, exist_ok=True)
