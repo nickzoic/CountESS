@@ -37,6 +37,12 @@ from typing import Any, Iterable
 logger = logging.getLogger(__name__)
 
 
+class SqlError(ValueError):
+    """A value which can't be put in SQL, such as a column which hasn't been chosen yet, so whatever has it isn't
+    (yet) set up properly.  This isn't for a mistake in how the pieces are put together (see Sql.template): that is
+    a TypeError or KeyError, which is a mistake in the code and not something to wait for somebody to fix."""
+
+
 class Fragment:
     """A piece of SQL.  `str(fragment)` is the SQL; the class says what kind of piece it is."""
 
@@ -68,12 +74,14 @@ class Id(Fragment):
     """The name of a table, column or alias, which is always quoted, so it can be anything DuckDB allows."""
 
     def __init__(self, name: str):
+        if name is None:
+            raise SqlError("there's no name for this identifier (a column which hasn't been chosen yet?)")
         if not isinstance(name, str):
             raise TypeError(f"an identifier has to be a str, not {name!r}")
         if not name:
-            raise ValueError("DuckDB doesn't allow an identifier with nothing in it")
+            raise SqlError("DuckDB doesn't allow an identifier with nothing in it")
         if "\x00" in name:
-            raise ValueError("DuckDB doesn't allow a NUL character in an identifier")
+            raise SqlError("DuckDB doesn't allow a NUL character in an identifier")
         super().__init__('"' + name.replace('"', '""') + '"')
         self.name = name
 
@@ -100,7 +108,7 @@ class Fn(Fragment):
 
     def __init__(self, name: str):
         if not isinstance(name, str) or not _FUNCTION_NAME.fullmatch(name):
-            raise ValueError(f"{name!r} isn't the name of a function")
+            raise SqlError(f"{name!r} isn't the name of a function")
         super().__init__(name)
 
 
@@ -109,7 +117,7 @@ class Type(Fragment):
 
     def __init__(self, name: str):
         if not isinstance(name, str) or not _TYPE_NAME.fullmatch(name.strip()):
-            raise ValueError(f"{name!r} isn't the name of a type: use Raw if it's one of the unusual ones")
+            raise SqlError(f"{name!r} isn't the name of a type: use Raw if it's one of the unusual ones")
         # (spaces made single, and none round brackets or commas, so `DECIMAL (10, 2)` is `DECIMAL(10,2)`)
         super().__init__(re.sub(r"\s*([(),])\s*", r"\1", re.sub(r"\s+", " ", name.strip())))
 
@@ -182,7 +190,7 @@ def literal_sql(value: Any) -> str:
         return f"{value!r}::DOUBLE"
     if isinstance(value, decimal.Decimal):
         if not value.is_finite():
-            raise ValueError(f"DuckDB can't have {value} as a DECIMAL")
+            raise SqlError(f"DuckDB can't have {value} as a DECIMAL")
         _sign, digits, exponent = value.as_tuple()
         assert isinstance(exponent, int)
         if exponent >= 0:
@@ -192,7 +200,7 @@ def literal_sql(value: Any) -> str:
         return f"{value}::DECIMAL({len(digits)},{-exponent})"
     if isinstance(value, str):
         if "\x00" in value:
-            raise ValueError("DuckDB can't have a NUL character in a string")
+            raise SqlError("DuckDB can't have a NUL character in a string")
         return "'" + value.replace("'", "''") + "'"
     if isinstance(value, bytes):
         return "'" + "".join(f"\\x{b:02X}" for b in value) + "'::BLOB"

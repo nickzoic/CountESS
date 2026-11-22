@@ -15,6 +15,7 @@ from countess.utils.sql import (
     Lit,
     Raw,
     Sql,
+    SqlError,
     Type,
     columns_alias,
     join,
@@ -59,7 +60,7 @@ def test_an_identifier_is_the_name_of_a_column_whatever_it_is(ddbc, name):
     assert ddbc.sql(str(Sql.template("select {col} + 1 from t", col=Id(name)))).fetchone() == (42,)
 
 
-@pytest.mark.parametrize("name,error", [(None, TypeError), (5, TypeError), ("", ValueError), ("a\x00b", ValueError)])
+@pytest.mark.parametrize("name,error", [(None, SqlError), (5, TypeError), ("", SqlError), ("a\x00b", SqlError)])
 def test_things_which_cant_be_identifiers_are_refused_where_they_are_made(name, error):
     with pytest.raises(error):
         Id(name)
@@ -285,3 +286,18 @@ def test_the_alias_of_columns_has_the_match_in_it_and_a_backslash_is_a_backslash
     ddbc.sql('create table p as select 1 as "v_~n"')
     alias = columns_alias(prefix + "__", suffix="!")
     assert ddbc.sql(f"select COLUMNS('^(.*)_~n$') AS {alias} from p").columns == [f"{prefix}__v!"]
+
+
+def test_a_value_which_cant_be_used_is_an_SqlError_but_a_mistake_in_the_code_is_not():
+    """So that something which isn't set up yet can be waited for, and a mistake is let through."""
+    for make in (lambda: Id(None), lambda: Id(""), lambda: Lit("a\x00b"), lambda: Fn("a b"), lambda: Type("x)")):
+        with pytest.raises(SqlError):
+            make()
+    for make in (lambda: Id(5), lambda: Lit(object()), lambda: Sql.template("{x}", x="plain"), lambda: join(["plain"])):
+        with pytest.raises(TypeError) as excinfo:
+            make()
+        assert not isinstance(excinfo.value, SqlError)
+    with pytest.raises(KeyError) as excinfo:
+        Sql.template("{missing}")
+    assert not isinstance(excinfo.value, SqlError)
+    assert issubclass(SqlError, ValueError)

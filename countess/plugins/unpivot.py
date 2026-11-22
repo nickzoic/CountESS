@@ -22,7 +22,7 @@ class UnpivotPlugin(DuckdbSqlPlugin):
     value_column = StringParam("Value Column")
     omit_blanks = BooleanParam("Omit Blanks?")
 
-    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[str]:
+    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[Sql]:
         column_set = set(columns)
         melt_cols = [p.label for p in self.columns if p.value and p.label in column_set]
         value_col = Id(self.value_column.value or "value")
@@ -38,4 +38,4 @@ class UnpivotPlugin(DuckdbSqlPlugin):
         if self.omit_blanks:
             query = Sql.template("SELECT * FROM ({query}) WHERE {value}::string != ''", query=query, value=value_col)
 
-        return str(query)
+        return query
