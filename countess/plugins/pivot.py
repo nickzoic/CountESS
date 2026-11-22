@@ -1,5 +1,4 @@
 import logging
-import re
 from typing import Optional
 
 from duckdb import DuckDBPyConnection, DuckDBPyRelation
@@ -7,12 +6,8 @@ from duckdb import DuckDBPyConnection, DuckDBPyRelation
 from countess import VERSION
 from countess.core.parameters import BooleanParam, ChoiceParam, PerColumnArrayParam
 from countess.core.plugins import DuckdbSimplePlugin
-from countess.utils.duckdb import (
-    duckdb_choose_special,
-    duckdb_dtype_is_numeric,
-    duckdb_escape_identifier,
-    duckdb_escape_literal,
-)
+from countess.utils.duckdb import duckdb_choose_special, duckdb_dtype_is_numeric
+from countess.utils.sql import Fn, Id, Lit, Sql, columns_alias, join, regex_escape
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +20,7 @@ def pivot_column_pattern(pivot_char: str, expand_col: str) -> str:
     start) which mean something else in a regular expression.  It has to match the whole name, or the columns of
     "n" would match those of "n2" as well.  And a . has to be able to match a newline too, or a newline in the
     value it picks out would cut off whatever's before it."""
-    return "(?s)^(.*)_" + re.escape(pivot_char + expand_col) + "$"
+    return "(?s)^(.*)_" + regex_escape(pivot_char + expand_col) + "$"
 
 
 class PivotPlugin(DuckdbSimplePlugin):
@@ -65,10 +60,11 @@ class PivotPlugin(DuckdbSimplePlugin):
         # our own custom one ... this is what previous CountESS used
         # but it frankly could be better or customizable.
         if self.short_names:
-            pivot_str = " || '_' || ".join(duckdb_escape_identifier(pc) for pc in pivot_cols)
+            pivot_expr = join((Id(pc) for pc in pivot_cols), sep=" || '_' || ")
         else:
-            pivot_str = " || '__' || ".join(
-                duckdb_escape_literal(pc + "_") + " || " + duckdb_escape_identifier(pc) for pc in pivot_cols
+            pivot_expr = join(
+                (Sql.template("{label} || {column}", label=Lit(pc + "_"), column=Id(pc)) for pc in pivot_cols),
+                sep=" || '__' || ",
             )
 
         # Pick an arbitrary character that isn't in any of the
@@ -79,50 +75,45 @@ class PivotPlugin(DuckdbSimplePlugin):
         # produces clauses like `SUM("foo") AS "~foo"` and the pivot will
         # then make columns like "value_~foo" (short names) or "column_value__~foo"
         # (long names)
-        using_str = ", ".join(
-            "%s(%s) AS %s"
-            % (
-                self.aggfunc.value if column_is_numeric[ec] else "string_agg",
-                duckdb_escape_identifier(ec),
-                duckdb_escape_identifier(pivot_char + ec),
+        using = join(
+            Sql.template(
+                "{aggregate}({column}) AS {output}",
+                aggregate=Fn(self.aggfunc.value if column_is_numeric[ec] else "string_agg"),
+                column=Id(ec),
+                output=Id(pivot_char + ec),
             )
             for ec in expand_cols
         )
-        group_str = ", ".join(duckdb_escape_identifier(ic) for ic in index_cols)
 
         # The PIVOT is of a table with just the columns which are used in it.  When there are no index columns
         # there's no GROUP BY, and DuckDB then groups by all of the columns which are left over, so the ones which
         # are dropped, which should be ignored, would make a row of the output for each different thing in them.
         used_cols = list(dict.fromkeys(index_cols + pivot_cols + expand_cols))
-        used_str = ", ".join(duckdb_escape_identifier(uc) for uc in used_cols)
+        query = Sql.template(
+            "PIVOT (SELECT {used} FROM {source}) ON {pivot} USING {using}",
+            used=join(Id(uc) for uc in used_cols),
+            source=Id(source.alias),
+            pivot=pivot_expr,
+            using=using,
+        )
+        if index_cols:
+            query = Sql.template("{query} GROUP BY {group}", query=query, group=join(Id(ic) for ic in index_cols))
 
-        query_str = f"PIVOT (SELECT {used_str} FROM {source.alias}) ON {pivot_str} USING {using_str}"
-        if group_str:
-            query_str = f"{query_str} GROUP BY {group_str}"
-
-        logger.debug("PivotPlugin.execute query_str %s", query_str)
-        rel = ddbc.sql(query_str)
+        logger.debug("PivotPlugin.execute query %s", query)
+        rel = query.relation(ddbc)
 
         # Rather than keep the duckdb columns we match them and switch them to our
         # preferred format.
-        project_str = ", ".join(
-            ("COALESCE(" if self.default_0 and column_is_numeric[ec] else "")
-            + "COLUMNS("
-            + duckdb_escape_literal(pivot_column_pattern(pivot_char, ec))
-            + ")"
-            + (", 0)" if self.default_0 and column_is_numeric[ec] else "")
-            + " AS "
-            # (the new name is a template in which \1 is what the pattern picks out, so a backslash of
-            # the column's own has to be escaped or DuckDB refuses it: "Backslashes must either be escaped
-            # or followed by a number")
-            + duckdb_escape_literal(ec.replace("\\", "\\\\") + ("_" if self.short_names else "__") + r"\1")
-            for ec in expand_cols
-        )
+        def renamed(ec: str) -> Sql:
+            columns = Sql.template("COLUMNS({pattern})", pattern=Lit(pivot_column_pattern(pivot_char, ec)))
+            if self.default_0 and column_is_numeric[ec]:
+                columns = Sql.template("COALESCE({columns}, 0)", columns=columns)
+            alias = columns_alias(ec + ("_" if self.short_names else "__"))
+            return Sql.template("{columns} AS {alias}", columns=columns, alias=alias)
 
-        if index_cols:
-            project_str = (", ".join([duckdb_escape_identifier(ic) for ic in index_cols])) + ", " + project_str
+        projection = join([*(Id(ic) for ic in index_cols), *(renamed(ec) for ec in expand_cols)])
 
-        logger.debug("PivotPlugin.execute project_str %s", project_str)
+        logger.debug("PivotPlugin.execute projection %s", projection)
         logger.debug("PivotPlugin.execute project columns %s", rel.columns)
 
-        return rel.project(project_str)
+        return rel.project(str(projection))
