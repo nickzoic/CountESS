@@ -4,7 +4,7 @@ from typing import Iterable, Optional
 from countess import VERSION
 from countess.core.parameters import BooleanParam, ColumnOrNoneChoiceParam, PerNumericColumnArrayParam, ScalarParam
 from countess.core.plugins import DuckdbSqlPlugin
-from countess.utils.duckdb import duckdb_escape_identifier, duckdb_escape_literal
+from countess.utils.sql import EMPTY, Id, Lit, Sql, join
 
 logger = logging.getLogger(__name__)
 
@@ -20,32 +20,34 @@ class CorrelationPlugin(DuckdbSqlPlugin):
     columns = PerNumericColumnArrayParam("Columns", BooleanParam("Correlate?", False))
     group = ColumnOrNoneChoiceParam("Group")
 
-    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[str]:
+    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[Sql]:
         columns_params = [cp for cp in self.columns.params if isinstance(cp, ScalarParam)]
-        grp = duckdb_escape_identifier(self.group.value) if self.group.is_not_none() else None
+        grp = Id(self.group.value) if self.group.is_not_none() else None
 
         if sum(1 for cp in columns_params if cp.value) < 2:
             return None
 
-        labels_and_identifiers = [
-            (
-                duckdb_escape_literal(c1.label),
-                duckdb_escape_literal(c2.label),
-                duckdb_escape_identifier(c1.label),
-                duckdb_escape_identifier(c2.label),
-            )
-            for c1 in columns_params
-            for c2 in columns_params
-            if c1.value and c2.value and c1.label < c2.label
-        ]
+        # (the total over all the groups, which rollup adds, has a NULL for its group)
+        group_select = Sql.template("{group}, ", group=grp) if grp else EMPTY
+        group_by = Sql.template("GROUP BY ROLLUP({group})", group=grp) if grp else EMPTY
 
-        return " union all ".join(
-            f"""
-select {(grp + ", ") if grp else ""} {l1} as column_x, {l2} as column_y,
-corr({i2},{i1}) as correlation_coefficient,
-covar_pop({i2}, {i1}) as covariance_population
-from {table_name} where {i1} is not null and {i2} is not null
-{("group by rollup("+grp+")") if grp else ""}
-            """
-            for l1, l2, i1, i2 in labels_and_identifiers
+        return join(
+            (
+                Sql.template(
+                    "SELECT {group_select}{label_x} AS column_x, {label_y} AS column_y, "
+                    "corr({y}, {x}) AS correlation_coefficient, covar_pop({y}, {x}) AS covariance_population "
+                    "FROM {table} WHERE {x} IS NOT NULL AND {y} IS NOT NULL {group_by}",
+                    group_select=group_select,
+                    label_x=Lit(c1.label),
+                    label_y=Lit(c2.label),
+                    x=Id(c1.label),
+                    y=Id(c2.label),
+                    table=Id(table_name),
+                    group_by=group_by,
+                )
+                for c1 in columns_params
+                for c2 in columns_params
+                if c1.value and c2.value and c1.label < c2.label
+            ),
+            sep=" UNION ALL ",
         )

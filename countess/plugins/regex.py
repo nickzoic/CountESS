@@ -13,7 +13,7 @@ from countess.core.parameters import (
     StringParam,
 )
 from countess.core.plugins import DuckdbSimplePlugin
-from countess.utils.duckdb import duckdb_escape_identifier, duckdb_escape_literal
+from countess.utils.sql import Fragment, Id, Lit, Raw, Sql, Type, join
 
 logger = logging.getLogger(__name__)
 
@@ -38,34 +38,33 @@ class RegexToolPlugin(DuckdbSimplePlugin):
     def execute(
         self, ddbc: DuckDBPyConnection, source: DuckDBPyRelation, row_limit: Optional[int] = None
     ) -> Optional[DuckDBPyRelation]:
-        column_id = duckdb_escape_identifier(self.column.value)
-        regexp_value = duckdb_escape_literal(self.regex.value)
-        output_ids = [duckdb_escape_literal(o.name.value) for o in self.output if o.name.value]
-        output_types = [
-            duckdb_escape_identifier(o.name.value) + " " + o.datatype.value for o in self.output if o.name.value
-        ]
+        column = Id(self.column.value)
+        pattern = Lit(self.regex.value)
+        outputs = [o for o in self.output if o.name.value]
 
+        proj: Fragment
         if self.drop_column:
-            proj = ",".join(duckdb_escape_identifier(c) for c in source.columns if c != self.column.value)
+            proj = join(Id(c) for c in source.columns if c != self.column.value)
         else:
-            proj = "*"
+            proj = Raw("*")
 
-        if output_ids:
-            if proj:
-                proj += ","
-            proj += f"""
-                unnest(try_cast(
-                    regexp_extract({column_id}, {regexp_value}, [{','.join(output_ids)}])
-                    as struct({','.join(output_types)})
-                ))
-            """
+        if outputs:
+            extract = Sql.template(
+                "unnest(try_cast(regexp_extract({column}, {pattern}, [{names}]) AS struct({types})))",
+                column=column,
+                pattern=pattern,
+                names=join(Lit(o.name.value) for o in outputs),
+                types=join(
+                    Sql.template("{name} {type}", name=Id(o.name.value), type=Type(o.datatype.value)) for o in outputs
+                ),
+            )
+            proj = join([part for part in (proj, extract) if part])
 
         logger.debug("RegexToolPlugin proj %s", proj)
 
         if self.drop_unmatch:
-            filt = f"regexp_matches({column_id}, {regexp_value})"
+            filt = Sql.template("regexp_matches({column}, {pattern})", column=column, pattern=pattern)
             logger.debug("RegexToolPlugin filt %s", filt)
-            return source.filter(filt).project(proj)
+            return source.filter(str(filt)).project(str(proj))
 
-        else:
-            return source.project(proj)
+        return source.project(str(proj))

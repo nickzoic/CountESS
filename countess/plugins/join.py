@@ -7,7 +7,8 @@ from duckdb import DuckDBPyConnection, DuckDBPyRelation
 from countess import VERSION
 from countess.core.parameters import ArrayParam, BooleanParam, ColumnChoiceParam, ColumnOrNoneChoiceParam, MultiParam
 from countess.core.plugins import DuckdbPlugin
-from countess.utils.duckdb import duckdb_dtype_is_numeric, duckdb_escape_identifier
+from countess.utils.duckdb import duckdb_dtype_is_numeric
+from countess.utils.sql import Id, Lit, Raw, Sql, join
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +68,8 @@ class JoinPlugin(DuckdbPlugin):
         tables = list(sources.values())
         required = [input_.required.value for input_ in self.inputs]
 
-        select_str = ", ".join(
-            f"N_{num}.{duckdb_escape_identifier(cname)}"
+        select = join(
+            Id.dotted(f"N_{num}", cname)
             for num, table in enumerate(tables)
             for cname in table.columns
             if not (
@@ -88,41 +89,47 @@ class JoinPlugin(DuckdbPlugin):
             )
         )
 
-        query = f"SELECT {select_str} FROM {tables[0].alias} AS N_0"
+        query = Sql.template(
+            "SELECT {select} FROM {table} AS {alias}", select=select, table=Id(tables[0].alias), alias=Id("N_0")
+        )
         for num, table in enumerate(tables[1:], 1):
-            join_how = _join_how(required[0], required[num])
-            join_on = (
-                "N_0."
-                + duckdb_escape_identifier(self.inputs[0].join_on.value)
-                + f" = N_{num}."
-                + duckdb_escape_identifier(self.inputs[num].join_on.value)
-            )
-            if self.inputs[0].join_2.is_not_none() and self.inputs[num].join_2.is_not_none():
-                join_on += (
-                    "AND N_0."
-                    + duckdb_escape_identifier(self.inputs[0].join_2.value)
-                    + f" = N_{num}."
-                    + duckdb_escape_identifier(self.inputs[num].join_2.value)
+            # the first table's join columns are matched with those of this one, as far as there are two of them
+            conditions = [
+                Sql.template(
+                    "{left} = {right}",
+                    left=Id.dotted("N_0", self.inputs[0].join_on.value),
+                    right=Id.dotted(f"N_{num}", self.inputs[num].join_on.value),
                 )
-            if self.inputs[0].join_3.is_not_none() and self.inputs[num].join_3.is_not_none():
-                join_on += (
-                    "AND N_0."
-                    + duckdb_escape_identifier(self.inputs[0].join_3.value)
-                    + f" = N_{num}."
-                    + duckdb_escape_identifier(self.inputs[num].join_3.value)
-                )
+            ]
+            for key in ("join_2", "join_3"):
+                first, this = getattr(self.inputs[0], key), getattr(self.inputs[num], key)
+                if first.is_not_none() and this.is_not_none():
+                    conditions.append(
+                        Sql.template(
+                            "{left} = {right}",
+                            left=Id.dotted("N_0", first.value),
+                            right=Id.dotted(f"N_{num}", this.value),
+                        )
+                    )
 
-            query += f" {join_how} JOIN {table.alias} AS N_{num} ON {join_on}"
+            query = Sql.template(
+                "{query} {how} JOIN {table} AS {alias} ON {on}",
+                query=query,
+                how=Raw(_join_how(required[0], required[num])),
+                table=Id(table.alias),
+                alias=Id(f"N_{num}"),
+                on=join(conditions, sep=" AND "),
+            )
 
         if row_limit is not None:
-            query += f" LIMIT {row_limit}"
+            query = Sql.template("{query} LIMIT {limit}", query=query, limit=Lit(row_limit))
 
         logger.debug("JoinPlugin.execute_multi tables[0] %s %d", tables[0].alias, len(tables[0]))
         logger.debug("JoinPlugin.execute_multi tables[1] %s %d", tables[1].alias, len(tables[1]))
         logger.debug("JoinPlugin.execute_multi query %s", query)
 
         try:
-            rel = ddbc.sql(query)
+            rel = query.relation(ddbc)
             logger.debug("JoinPlugin.execute_multi output %d", len(rel))
             return rel
         except duckdb.ConversionException as exc:

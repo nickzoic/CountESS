@@ -4,7 +4,7 @@ from typing import Iterable, Optional
 from countess import VERSION
 from countess.core.parameters import BooleanParam, PerColumnArrayParam, TabularMultiParam
 from countess.core.plugins import DuckdbSqlPlugin
-from countess.utils.duckdb import duckdb_escape_identifier
+from countess.utils.sql import Fn, Id, Raw, Sql, join
 
 logger = logging.getLogger(__name__)
 
@@ -21,11 +21,13 @@ class ColumnMultiParam(TabularMultiParam):
     var_pop = BooleanParam("Var")
 
 
-def _op(op_name, col_name):
-    col_ident = duckdb_escape_identifier(col_name)
-    col_output = duckdb_escape_identifier(col_name + "__" + op_name)
-    op_call = "COUNT(DISTINCT " if op_name == "nunique" else op_name.upper() + "("
-    return f"{op_call}{col_ident}) AS {col_output}"
+def _op(op_name: str, col_name: str) -> Sql:
+    column = Id(col_name)
+    if op_name == "nunique":
+        call = Sql.template("COUNT(DISTINCT {column})", column=column)
+    else:
+        call = Sql.template("{function}({column})", function=Fn(op_name.upper()), column=column)
+    return Sql.template("{call} AS {output}", call=call, output=Id(col_name + "__" + op_name))
 
 
 class GroupByPlugin(DuckdbSqlPlugin):
@@ -40,32 +42,36 @@ class GroupByPlugin(DuckdbSqlPlugin):
     columns = PerColumnArrayParam("Columns", ColumnMultiParam("Column"))
     join = BooleanParam("Join Back?")
 
-    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[str]:
+    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[Sql]:
         column_params = list(self.columns.get_column_params())
-        columns = (
-            ", ".join(
-                _op(op, col_name)
-                for col_name, col_param in column_params
-                for op, bp in col_param.params.items()
-                if bp.value and op != "index"
-            )
-            or "count(*) as count"
-        )
-        group_by = ", ".join(
-            duckdb_escape_identifier(col_name)
+        aggregates = join(
+            _op(op, col_name)
             for col_name, col_param in column_params
-            if col_param.params["index"].value
-        )
+            for op, bp in col_param.params.items()
+            if bp.value and op != "index"
+        ) or Raw("count(*) AS count")
+        group_by = join(Id(col_name) for col_name, col_param in column_params if col_param.params["index"].value)
+        table = Id(table_name)
+
         if self.join:
             if group_by:
-                return (
-                    f"SELECT * FROM {table_name} JOIN (SELECT {group_by}, {columns} "
-                    f"FROM {table_name} GROUP BY {group_by}) USING ({group_by})"
+                return Sql.template(
+                    "SELECT * FROM {table} JOIN (SELECT {group_by}, {aggregates} FROM {table} GROUP BY {group_by}) "
+                    "USING ({group_by})",
+                    table=table,
+                    group_by=group_by,
+                    aggregates=aggregates,
                 )
-            else:
-                return f"SELECT * FROM {table_name} CROSS JOIN (SELECT {columns} FROM {table_name})"
-        else:
-            if group_by:
-                return f"SELECT {group_by}, {columns} FROM {table_name} GROUP BY {group_by}"
-            else:
-                return f"SELECT {columns} FROM {table_name}"
+            return Sql.template(
+                "SELECT * FROM {table} CROSS JOIN (SELECT {aggregates} FROM {table})",
+                table=table,
+                aggregates=aggregates,
+            )
+        if group_by:
+            return Sql.template(
+                "SELECT {group_by}, {aggregates} FROM {table} GROUP BY {group_by}",
+                group_by=group_by,
+                aggregates=aggregates,
+                table=table,
+            )
+        return Sql.template("SELECT {aggregates} FROM {table}", aggregates=aggregates, table=table)
