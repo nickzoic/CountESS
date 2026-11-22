@@ -415,6 +415,7 @@ sorting.0.order_by = 'k'
 def test_previewing_a_parquet_file_with_every_kind_of_column(ddbc, tmp_path):
     """The preview has to cope with all the types which a Parquet file can have, not just
     the few which CSV loading gives."""
+    pytest.importorskip("tkinter", exc_type=ImportError)  # (not every Python has it, and this isn't in tests/gui)
     from countess.gui.main import make_root  # pylint: disable=import-outside-toplevel
     from countess.gui.tabular import TabularDataFrame  # pylint: disable=import-outside-toplevel
 

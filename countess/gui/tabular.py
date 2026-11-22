@@ -1,9 +1,9 @@
 import io
 import logging
 import tkinter as tk
-from tkinter import font as tk_font
 from functools import partial
 from math import ceil, floor, isinf, isnan
+from tkinter import font as tk_font
 from tkinter import ttk
 from typing import Callable, Optional, Union
 

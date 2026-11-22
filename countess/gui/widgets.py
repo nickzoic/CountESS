@@ -303,7 +303,7 @@ class LabeledProgressbar(ttk.Progressbar):
         self.done = False
         super().__init__(master, *args, **kwargs)
 
-    def progress_update(self, text: str, percentage: Optional[int] = None):
+    def progress_update(self, text: str, percentage: Optional[float] = None):
         if percentage is None:
             self.config(mode="indeterminate")
             self.step(5)

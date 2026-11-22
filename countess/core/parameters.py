@@ -53,11 +53,12 @@ class BaseParam:
     def set_column_choices(self, choices: Mapping[str, bool]):
         pass
 
-    # The JSON interface: every kind of parameter has to implement these.
-    # (get_json_data and set_json_data's `base_dir` is what filenames are relative to.)
+    # The JSON interface.  get_json_schema has a default of "anything goes", but every kind of
+    # parameter has to say how to get and set its data.  (The `base_dir` of get_json_data and
+    # set_json_data is what filenames are relative to.)
 
-    def get_json_schema(self) -> dict:
-        raise NotImplementedError(f"Implement {self.__class__.__name__}.get_json_schema()")
+    def get_json_schema(self):
+        return True
 
     def get_json_data(self, base_dir=".") -> Any:
         raise NotImplementedError(f"Implement {self.__class__.__name__}.get_json_data()")
@@ -155,7 +156,7 @@ class MultiValueParam(BaseParam):
         return digest.hexdigest()
 
     def get_json_schema(self):
-        return { "title": self.label, "type": "array" }
+        return {"title": self.label, "type": "array"}
 
     def get_json_data(self, base_dir="."):
         # a set isn't valid JSON, and the order should be stable
@@ -167,6 +168,7 @@ class MultiValueParam(BaseParam):
         self.reset_value()
         for v in value:
             self.set_value(v)
+
 
 class ScalarWithOperatorsParam(ScalarParam):
     # Operator Methods which apply to both StringParams and
@@ -224,7 +226,7 @@ class StringParam(ScalarWithOperatorsParam):
         return hash(self._value)
 
     def get_json_schema(self):
-        return { "title": self.label, "type": "string" }
+        return {"title": self.label, "type": "string"}
 
     def get_json_data(self, base_dir="."):
         return self._value or ""
@@ -299,14 +301,16 @@ class NumericParam(ScalarWithOperatorsParam):
     # dumb way works with mypy and pylint.
 
     def get_json_schema(self):
-        return { "title": self.label, "type": "number" }
+        return {"title": self.label, "type": "number"}
+
 
 class IntegerParam(NumericParam):
     _value: int = 0
     var_type = int
 
     def get_json_schema(self):
-        return { "title": self.label, "type": "integer" }
+        return {"title": self.label, "type": "integer"}
+
 
 class FloatParam(NumericParam):
     _value: float = 0.0
@@ -335,6 +339,7 @@ class DecimalParam(NumericParam):
     _value: Decimal = Decimal(0)
     var_type = Decimal
 
+
 class BooleanParam(ScalarParam):
     _value: bool = False
     var_type = bool
@@ -360,7 +365,8 @@ class BooleanParam(ScalarParam):
         return str(self._value)
 
     def get_json_schema(self):
-        return { "title": self.label, "type": "boolean" }
+        return {"title": self.label, "type": "boolean"}
+
     # XXX are there other operator methods which need to be implemented here?
 
 
@@ -398,7 +404,7 @@ class StringCharacterSetParam(StringParam):
 
     def get_json_schema(self):
         escaped_char_set = "".join(re.escape(c) for c in sorted(self.character_set))
-        return { "type": "string", "title": self.label, "pattern": "^[" + escaped_char_set + "]*$" }
+        return {"type": "string", "title": self.label, "pattern": "^[" + escaped_char_set + "]*$"}
 
 
 class ColumnLabelParam(StringCharacterSetParam):
@@ -463,6 +469,7 @@ class FileBaseParam(StringParam):
             self.set_base_dir(base_dir)
         self.set_value(value)
 
+
 class FileParam(FileBaseParam):
     """A filename to be read as input."""
 
@@ -496,8 +503,9 @@ class FileParam(FileBaseParam):
 
     def get_json_schema(self):
         s = super().get_json_schema()
-        s.update({'filename': True})
+        s.update({"filename": True})
         return s
+
 
 class FileSaveParam(FileBaseParam):
     """A filename to save output as."""
@@ -570,7 +578,7 @@ class DictChoiceParam(ScalarWithOperatorsParam):
         return self.__class__(self.label, self.value, self.choices)
 
     def get_json_schema(self):
-        return { "title": self.label, "enum": list(self.choices.keys()) }
+        return {"title": self.label, "enum": list(self.choices.keys())}
 
     def get_json_data(self, base_dir="."):
         return self._choice
@@ -642,7 +650,7 @@ class ChoiceParam(ScalarWithOperatorsParam):
         return self.__class__(self.label, self.value, self.choices)
 
     def get_json_schema(self):
-        return { "title": self.label, "enum": self.choices }
+        return {"title": self.label, "enum": self.choices}
 
     def get_json_data(self, base_dir="."):
         return self._value
@@ -683,7 +691,7 @@ class MultiChoiceParam(MultiValueParam):
         return self.__class__(self.label, self._values, self.choices)
 
     def get_json_schema(self):
-        return { "title": self.label, "type": "array", "items": { "enum": self.choices }}
+        return {"title": self.label, "type": "array", "items": {"enum": self.choices}}
 
     def get_json_data(self, base_dir="."):
         extra = sorted((v for v in self._values if v not in self.choices), key=str)
@@ -750,11 +758,11 @@ class DataTypeOrNoneChoiceParam(DataTypeChoiceParam):
         return self.value != self.DEFAULT_VALUE
 
     def get_json_schema(self):
-        return { "title": self.label, "enum": self.choices + [ None ] }
+        return {"title": self.label, "enum": self.choices + [None]}
 
     def get_json_data(self, base_dir="."):
         return None if self.is_none() else self._value
-    
+
 
 class ColumnChoiceParam(ChoiceParam):
     """A ChoiceParam which DaskTransformPlugin knows
@@ -815,7 +823,6 @@ class ColumnGroupChoiceParam(ChoiceParam):
         return [prefix + s for s in self.get_suffixes()]
 
 
-
 class ColumnGroupOrNoneChoiceParam(ColumnGroupChoiceParam):
     DEFAULT_VALUE = "— NONE —"
 
@@ -863,7 +870,7 @@ class ColumnOrIndexChoiceParam(ColumnChoiceParam):
         return self.value != self.DEFAULT_VALUE
 
     def get_json_schema(self):
-        return {"title": self.label,  "enum": self.choices + [ None ] }
+        return {"title": self.label, "enum": self.choices + [None]}
 
     def get_json_data(self, base_dir="."):
         return None if self.is_index() else self.value
@@ -911,26 +918,27 @@ class ColumnOrStringParam(ColumnChoiceParam):
             "type": "object",
             "title": self.label,
             "properties": {
-                "column": { "enum": self.column_choices },
-                "string": { "type": "string" },
+                "column": {"enum": self.column_choices},
+                "string": {"type": "string"},
             },
             "additionalProperties": False,
-            "maxProperties": 1
+            "maxProperties": 1,
         }
 
     def get_json_data(self, base_dir="."):
         if self.get_column_name():
-            return { "column": self.get_column_name() }
+            return {"column": self.get_column_name()}
         else:
-            return { "string": self.value }
+            return {"string": self.value}
 
     def set_json_data(self, value, base_dir="."):
-        if 'column' in value:
-            self.value = self.PREFIX + value['column']
-        elif 'string' in value:
-            self.value = value['string']
+        if "column" in value:
+            self.value = self.PREFIX + value["column"]
+        elif "string" in value:
+            self.value = value["string"]
         else:
             self.value = self.DEFAULT_VALUE
+
 
 class ColumnOrIntegerParam(ColumnOrStringParam):
     DEFAULT_VALUE: int = 0
@@ -966,27 +974,26 @@ class ColumnOrIntegerParam(ColumnOrStringParam):
             "type": "object",
             "title": self.label,
             "properties": {
-                "column": { "enum": self.column_choices },
-                "integer": { "type": "integer" },
+                "column": {"enum": self.column_choices},
+                "integer": {"type": "integer"},
             },
             "additionalProperties": False,
-            "maxProperties": 1
+            "maxProperties": 1,
         }
 
     def get_json_data(self, base_dir="."):
         if self.get_column_name():
-            return { "column": self.get_column_name() }
+            return {"column": self.get_column_name()}
         else:
-            return { "integer": self.value }
+            return {"integer": self.value}
 
     def set_json_data(self, value, base_dir="."):
-        if 'column' in value:
-            self.value = self.PREFIX + value['column']
-        elif 'integer' in value:
-            self.value = value['integer']
+        if "column" in value:
+            self.value = self.PREFIX + value["column"]
+        elif "integer" in value:
+            self.value = value["integer"]
         else:
             self.value = self.DEFAULT_VALUE
-
 
 
 class HasSubParametersMixin:
@@ -1029,18 +1036,12 @@ class HasSubParametersMixin:
         return {
             "type": "object",
             "title": self.label,
-            "properties": {
-                key: param.get_json_schema()
-                for key, param in self.params.items()
-            },
+            "properties": {key: param.get_json_schema() for key, param in self.params.items()},
             "additionalProperties": False,
         }
 
     def get_json_data(self, base_dir="."):
-        return {
-            key: param.get_json_data(base_dir)
-            for key, param in self.params.items()
-        }
+        return {key: param.get_json_data(base_dir) for key, param in self.params.items()}
 
     def set_json_data(self, value, base_dir="."):
         # As with the .ini loader, a parameter which doesn't exist (any more) or can't
@@ -1172,27 +1173,17 @@ class ArrayParam(BaseParam):
 
     def get_json_schema(self):
         if self.read_only:
-            return {
-                "type": "array",
-                "prefixItems": [ p.get_json_schema() for p in self.params ],
-                "items": False
-            }
+            return {"type": "array", "prefixItems": [p.get_json_schema() for p in self.params], "items": False}
 
-        s = {
-            "type": "array",
-            "title": self.label,
-            "items": self.param.get_json_schema()
-        }
+        s = {"type": "array", "title": self.label, "items": self.param.get_json_schema()}
         if self.min_size:
-            s['minItems'] = self.min_size
+            s["minItems"] = self.min_size
         if self.max_size:
-            s['maxItems'] = self.max_size
+            s["maxItems"] = self.max_size
         return s
 
     def get_json_data(self, base_dir="."):
-        return (
-            [ p.get_json_data(base_dir) for p in self.params ]
-        )
+        return [p.get_json_data(base_dir) for p in self.params]
 
     def set_json_data(self, value, base_dir="."):
         self.params = []
@@ -1268,17 +1259,10 @@ class PerColumnArrayParam(ArrayParam):
             yield p.label, p
 
     def get_json_schema(self):
-        return {
-            "type": "object",
-            "title": self.label,
-            "additionalProperties": self.param.get_json_schema()
-        }
+        return {"type": "object", "title": self.label, "additionalProperties": self.param.get_json_schema()}
 
     def get_json_data(self, base_dir="."):
-        return {
-            p.label: p.get_json_data(base_dir)
-            for p in self.params
-        }
+        return {p.label: p.get_json_data(base_dir) for p in self.params}
 
     def set_json_data(self, value, base_dir="."):
         self.params = []
@@ -1292,7 +1276,6 @@ class PerColumnArrayParam(ArrayParam):
         # (add_row calls relabel() which renames every row, so only name them at the end)
         for p, k in rows:
             p.label = k
-
 
 
 class PerNumericColumnArrayParam(PerColumnArrayParam):
@@ -1394,7 +1377,7 @@ class TabularMultiParam(MultiParam):
 
     def get_json_schema(self):
         s = super().get_json_schema()
-        s.update({'tabular': True})
+        s.update({"tabular": True})
         return s
 
 
@@ -1404,6 +1387,5 @@ class FramedMultiParam(MultiParam):
 
     def get_json_schema(self):
         s = super().get_json_schema()
-        s.update({'framed': True})
+        s.update({"framed": True})
         return s
-

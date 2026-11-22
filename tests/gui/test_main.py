@@ -63,3 +63,4 @@ def test_mac_quit_runs_the_exit_button_code():
         window.graph.stop_thread(timeout=10)
     finally:
         root.destroy()
+

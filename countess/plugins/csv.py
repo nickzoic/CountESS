@@ -44,6 +44,13 @@ class ColumnsMultiParam(MultiParam):
 CSV_DELIMITER_CHOICES: dict[str, str] = {",": ",", ";": ";", "|": "|", "TAB": "\t", "SPACE": " "}
 
 
+def csv_sql_type(choice: str) -> str:
+    """The DuckDB type which a column is loaded as, for the type it's been given.  They're the same
+    but for INTEGER: that's a 64 bit integer, as a Python int effectively is, since DuckDB's own INTEGER
+    is only 32 bit and a number outside of that would quietly become a NULL (3000000000 does)."""
+    return "BIGINT" if choice == "INTEGER" else choice
+
+
 class ReadCsvOptions(TypedDict):
     sep: str
     null_padding: bool
@@ -100,9 +107,9 @@ class LoadCsvPlugin(DuckdbLoadFileWithTheLotPlugin):
                 if cp is None
                 else (
                     (
-                        f"TRY_CAST(NULL as {cp.type.value})"
+                        f"TRY_CAST(NULL as {csv_sql_type(cp.type.value)})"
                         if cn is None
-                        else f"TRY_CAST({duckdb_escape_identifier(cn)} as {cp.type.value})"
+                        else f"TRY_CAST({duckdb_escape_identifier(cn)} as {csv_sql_type(cp.type.value)})"
                     )
                     + " AS "
                     + (duckdb_escape_identifier(cp.name.value) if cp.name.value else "column%d" % num)

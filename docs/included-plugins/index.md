@@ -18,7 +18,7 @@ CountESS is not limited to these included plugins: anyone can write and publish 
 Loads data from CSV (and similar delimited text formats) into a dataframe.
 Unfortunately CSV is not well standardized so there are quite a few options.
 
-*Note that pandas can't represent null values in integer columns, so columns containing null values and set to integer data type will be promoted to float columns.*
+Files ending in `.gz`, `.bz2` or `.xz` are decompressed as they are read.
 
 #### Parameters
 
@@ -36,6 +36,32 @@ filename_column
 
 columns
 : for each column, specify a name and data type, and optionally index this column
+
+#### Column types
+
+If no columns are listed DuckDB works out for itself what is in each of them: whole numbers are 64 bit integers, other numbers are double precision floating point numbers, dates, times and `true`/`false` values are recognised, and anything else is text.  Otherwise each column listed is given one of these types, and a column which is given no type is left out.  Anything which can't be read as the type it has been given is left empty: it doesn't stop the file loading.
+
+STRING
+: text, exactly as it is in the file
+
+INTEGER
+: a 64 bit whole number, from -9223372036854775808 to 9223372036854775807.  Numbers outside of that are left empty.  A number with a fraction is rounded to the nearest whole number.  Empty values stay empty, they don't turn the rest of the column into floating point numbers
+
+FLOAT
+: a number which may have a fraction.  This is stored as a single precision (32 bit) floating point number, which holds about 7 significant digits: more than that are rounded off, as 0.123456789012345 is to 0.12345679
+
+BOOLEAN
+: `true` or `false`
+
+#### How the file is read
+
+The reader is lenient about the files it will accept, and these are the things which follow from that:
+
+* A row with too few values is filled out with empty values, but a row with too many values means that the file can't be loaded.
+* Blank lines are skipped, and both Unix and Windows line endings, and a UTF-8 byte order mark at the start of the file, are fine.
+* A value which has the delimiter in it can be put in double quotes, as in `"Smith, John"`.
+* A double quote inside a quoted value is kept as it is, so `"say ""hi"""` is loaded as `say ""hi""` (with both pairs of quotes) and a quote inside a value which isn't quoted is just a character.  This means that text which has quotes in it is not quite the same after being saved with the CSV Writer, which doubles them as the CSV standard says, and loaded again.
+* A quoted value can't have a line break inside it: a file which has one can't be loaded.
 
 ### CSV Writer
 
@@ -223,7 +249,9 @@ Performs a "pivot" operation on the data table.
 
 Each column can be specified as an "Index", "Pivot" or "Expand" column, or dropped.
 
-The result will have one row per Index value, with each of the "Expand" columns expanded to include each distinct value of the "Pivot" column(s).  Duplicate values are summed and missing values are set to `0`.
+The result will have one row per Index value, with each of the "Expand" columns expanded to include each distinct value of the "Pivot" column(s).  If no column is an Index column the result is a single row.  A column which is dropped has no effect at all on the result, whatever is in it.  The names of the columns, and the values in the Pivot columns, can have any characters in them.
+
+Duplicate values are combined with the Aggregation Function, which is `sum` unless it is changed.  A combination which doesn't occur in the data is empty, or `0` if "Default value 0?" is set.  The output columns are called `expand-column__pivot-column_value`, or `expand-column_value` if "Short Output Names?" is set.
 
 For example this data set:
 

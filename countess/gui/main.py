@@ -526,7 +526,7 @@ class LoggerFrame(tk.Frame):
         self.count += len(lines)
 
         # Don't let a long run's worth of log grow without limit.
-        n_lines = int(self.text.index("end-1c").split(".")[0]) - 1  # (the last line is empty)
+        n_lines = int(self.text.index("end-1c").split(".", maxsplit=1)[0]) - 1  # (the last line is empty)
         if n_lines > self.LOGGING_MAX_LINES:
             self.text.delete("1.0", f"{n_lines - self.LOGGING_MAX_LINES + 1}.0")
         if following:
@@ -587,11 +587,11 @@ class QueryProgressFrame(tk.Frame):
 
         while len(self.bars) < len(progress.running):
             self.bars.append(LabeledProgressbar(self, value=0))
-        for bar, entry in zip(self.bars, progress.running):
+        for progress_bar, entry in zip(self.bars, progress.running):
             if entry.percent is None:
-                bar.progress_update(f"{entry.node.name}: working…")  # (shows as "indeterminate")
+                progress_bar.progress_update(f"{entry.node.name}: working…")  # (shows as "indeterminate")
             else:
-                bar.progress_update(f"{entry.node.name}: {entry.percent:.0f}%", entry.percent)
+                progress_bar.progress_update(f"{entry.node.name}: {entry.percent:.0f}%", entry.percent)
 
         self.waiting_label["text"] = (
             f"{progress.waiting} more waiting" if progress.running else f"{progress.waiting} waiting"
@@ -607,8 +607,8 @@ class QueryProgressFrame(tk.Frame):
             return
         for widget in self.pack_slaves():
             widget.pack_forget()
-        for bar in self.bars[:n_bars]:
-            bar.pack(fill=tk.X, padx=2, pady=1)
+        for progress_bar in self.bars[:n_bars]:
+            progress_bar.pack(fill=tk.X, padx=2, pady=1)
         if show_waiting:
             self.waiting_label.pack(fill=tk.X, padx=2)
         self._layout = (n_bars, show_waiting)
@@ -696,6 +696,9 @@ class MainWindow:
         # On macOS, Quit (Cmd-Q or the application menu) runs ::tk::mac::Quit if it exists;
         # otherwise Tk calls exit() from inside mainloop(), and DuckDB's static destructors
         # then crash the interpreter. Quit the way the Exit button does instead.
+        # (This is `tk_parent.tk.createcommand` and not `tk_parent.createcommand` because only a Tk
+        # object has the latter, and tk_parent is any widget as far as mypy is concerned, which is
+        # what failed the checks when this was first added.)
         tk_parent.tk.createcommand("::tk::mac::Quit", self.program_exit)
 
         logger.debug("MainWindow.__init__(%s)", repr(config_filename))
