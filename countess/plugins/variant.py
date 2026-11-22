@@ -20,7 +20,7 @@ from countess.core.parameters import (
     StringParam,
 )
 from countess.core.plugins import DuckdbParallelTransformPlugin, DuckdbSqlPlugin
-from countess.utils.duckdb import duckdb_escape_identifier, duckdb_escape_literal
+from countess.utils.sql import Fragment, Id, Lit, Sql, join
 
 logger = logging.getLogger(__name__)
 
@@ -161,9 +161,9 @@ class VariantClassifier(DuckdbSqlPlugin):
 
     variant_col = ColumnChoiceParam("Protein variant Column", "variant")
 
-    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[str]:
-        variant_col_id = duckdb_escape_identifier(self.variant_col.value)
-        output_col_id = duckdb_escape_identifier(self.variant_col + "_type")
+    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[Sql]:
+        variant = Id(self.variant_col.value)
+        output = Id(self.variant_col + "_type")
 
         # the nested query stops any of the pattern matching columns
         # from colliding with source table columns, plus hopefully
@@ -174,22 +174,20 @@ class VariantClassifier(DuckdbSqlPlugin):
 
         hgvs_aa_re = "(?:" + "|".join(v for v in AA_CODES.values() if v != "Ter") + ")"
         short_aa_re = "[" + "".join(k for k in AA_CODES if k != "*") + "]"
-        plugin_label = duckdb_escape_literal(self.name + ": ")
 
-        classifier_re = duckdb_escape_literal(
-            re.sub(
-                r"\s+",
-                "",
-                rf"""
+        classifier_re = re.sub(
+            r"\s+",
+            "",
+            rf"""
             ^(_?[Ww][Tt]|p.=)$|
             ^p.{hgvs_aa_re}\d+({hgvs_aa_re}|=|del|dup|Ter)$|
             ^p.{hgvs_aa_re}\d+_{hgvs_aa_re}\d+(del|dup|ins{hgvs_aa_re}+)$|
             ^({short_aa_re})\d+({short_aa_re}|[=*X-])$
         """,
-            )
         )
 
-        return rf"""
+        return Sql.template(
+            r"""
             select S.*, case
                when T.wildtype != '' then 'W'
                when T.hgvs_1 = '=' then 'S'
@@ -209,31 +207,38 @@ class VariantClassifier(DuckdbSqlPlugin):
                end
                else warning(concat({plugin_label},
                    'unclassifiable variant: "', z, '"'), '?')
-               end as {output_col_id}
-            from {table_name} S join (
-                select {variant_col_id} as z, unnest(regexp_extract(
-                    {variant_col_id},
+               end as {output}
+            from {table} S join (
+                select {variant} as z, unnest(regexp_extract(
+                    {variant},
                     {classifier_re},
                     ['wildtype','hgvs_1','hgvs_2','short_1', 'short_2']
                 ))
-                from {table_name}
+                from {table}
                 group by z
-            ) T on S.{variant_col_id} = T.z
-        """
+            ) T on {source_variant} = T.z
+            """,
+            plugin_label=Lit(self.name + ": "),
+            output=output,
+            table=Id(table_name),
+            variant=variant,
+            classifier_re=Lit(classifier_re),
+            source_variant=Id.dotted("S", self.variant_col.value),
+        )
 
 
-def _translate_aa(expr: str, expr1: str = "") -> str:
+def _translate_aa(expr: Fragment, expr1: Optional[Fragment] = None) -> Sql:
+    """A CASE which turns the one letter code in `expr` into the three letter one (or, if there's an `expr1`, which
+    gives = if they are the same)"""
     # This looks ludicrous but it pushes all the work down into SQL so that
     # duckdb can run it without translating rows into Python etc.
-    return (
-        "CASE "
-        + (f"WHEN {expr}={expr1} THEN '='" if expr1 else "")
-        + " ".join(
-            f"WHEN {expr}={duckdb_escape_literal(k)} THEN {duckdb_escape_literal(v)}"
-            for k, v in list(AA_CODES.items()) + [("X", "Ter"), ("-", "del")]
-        )
-        + " ELSE NULL END"
-    )
+    whens = [
+        Sql.template("WHEN {expr} = {code} THEN {name}", expr=expr, code=Lit(k), name=Lit(v))
+        for k, v in list(AA_CODES.items()) + [("X", "Ter"), ("-", "del")]
+    ]
+    if expr1 is not None:
+        whens.insert(0, Sql.template("WHEN {expr} = {expr1} THEN '='", expr=expr, expr1=expr1))
+    return Sql.template("CASE {whens} ELSE NULL END", whens=join(whens, sep=" "))
 
 
 class VariantConverter(DuckdbSqlPlugin):
@@ -247,26 +252,39 @@ class VariantConverter(DuckdbSqlPlugin):
     prefix_nt = StringParam("Variant NT Prefix", "")
     offset = IntegerParam("Variant Location Offset", 0)
 
-    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[str]:
-        variant_col_id = duckdb_escape_identifier(self.variant_col.value)
-        output_col_id = duckdb_escape_identifier(self.variant_out.value)
-        offset = duckdb_escape_literal(self.offset.value) if self.offset else 0
-        prefix_aa = duckdb_escape_literal((self.prefix_aa.value + ":" if self.prefix_aa else "") + "p.")
-        prefix_nt = duckdb_escape_literal((self.prefix_nt.value + ":" if self.prefix_nt else "") + "c.")
+    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[Sql]:
+        variant = Id(self.variant_col.value)
+        output = Id(self.variant_out.value)
+        offset = Lit(self.offset.value)
+        prefix_aa = Lit((self.prefix_aa.value + ":" if self.prefix_aa else "") + "p.")
+        prefix_nt = Lit((self.prefix_nt.value + ":" if self.prefix_nt else "") + "c.")
 
-        columns = " ".join(duckdb_escape_identifier(c) + "," for c in columns if c != self.variant_out.value)
+        # (the first and last letter, the digits between them, and everything after syn_)
+        first = Sql.template("{variant}[1]", variant=variant)
+        last = Sql.template("{variant}[-1]", variant=variant)
+        digits = Sql.template("{variant}[2:-2]", variant=variant)
+        after_syn = Sql.template("{variant}[5:]", variant=variant)
 
         # XXX handle other short forms like _synNNNX>Y or whatever
-        return rf"""
-            SELECT {columns}
-            CASE
-                WHEN regexp_matches({variant_col_id}, 'wt', 'i') THEN {prefix_aa} || '='
-                WHEN regexp_matches({variant_col_id}, '[A-Z]\d+[*A-Z-]')
-                    THEN {prefix_aa} || {_translate_aa(variant_col_id + "[1]")} ||
-                        ({variant_col_id}[2:-2]::INTEGER + {offset})::TEXT ||
-                        {_translate_aa(variant_col_id + "[-1]", variant_col_id + "[1]")}
-                WHEN regexp_matches({variant_col_id}, 'syn_\d+[A-Z]>[A-Z]')
-                    THEN {prefix_nt} || {variant_col_id}[5:]
+        converted = Sql.template(
+            r"""CASE
+                WHEN regexp_matches({variant}, 'wt', 'i') THEN {prefix_aa} || '='
+                WHEN regexp_matches({variant}, '[A-Z]\d+[*A-Z-]')
+                    THEN {prefix_aa} || {first_aa} || ({digits}::INTEGER + {offset})::TEXT || {last_aa}
+                WHEN regexp_matches({variant}, 'syn_\d+[A-Z]>[A-Z]')
+                    THEN {prefix_nt} || {after_syn}
                 ELSE NULL
-            END AS {output_col_id} FROM {table_name}
-        """
+            END AS {output}""",
+            variant=variant,
+            prefix_aa=prefix_aa,
+            first_aa=_translate_aa(first),
+            digits=digits,
+            offset=offset,
+            last_aa=_translate_aa(last, first),
+            prefix_nt=prefix_nt,
+            after_syn=after_syn,
+            output=output,
+        )
+
+        fields = join([*(Id(c) for c in columns if c != self.variant_out.value), converted])
+        return Sql.template("SELECT {fields} FROM {table}", fields=fields, table=Id(table_name))
