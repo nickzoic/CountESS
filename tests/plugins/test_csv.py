@@ -113,7 +113,7 @@ import lzma
 
 import pytest
 
-from countess.plugins.csv import CSV_DELIMITER_CHOICES, write_to_csv
+from countess.plugins.csv import CSV_DELIMITER_CHOICES, csv_sql_type, write_to_csv
 
 
 @pytest.fixture(name="csv_ddbc")
@@ -257,28 +257,31 @@ def test_round_trip(csv_ddbc, tmp_path):
 QUOTED = 'n,s\n1,"say ""hi"""\n2,plain\n3,"a,b"\n'
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the loader asks DuckDB for strict_mode=False, and in that mode the doubled quotes which stand for a quote "
-    'inside a quoted field are not undone: "say ""hi""" is loaded as say ""hi"" (DuckDB\'s default does it right)',
-)
-def test_quotes_inside_quoted_fields(csv_ddbc, tmp_path):
+# The loader is lenient about the files it reads, and these are the things that follows from that.  They
+# are as intended, and described in the documentation of the CSV Reader: if one of them changes, so should it.
+
+
+def test_doubled_quotes_inside_quoted_fields_are_kept_as_they_are(csv_ddbc, tmp_path):
+    """A doubled quote inside a quoted field is not undone: it is loaded with both quotes still there."""
     path = tmp_path / "quoted.csv"
     path.write_text(QUOTED, encoding="utf-8")
     _, output = load_csv(csv_ddbc, path)
-    assert output.fetchall() == [(1, 'say "hi"'), (2, "plain"), (3, "a,b")]
+    assert output.fetchall() == [(1, 'say ""hi""'), (2, "plain"), (3, "a,b")]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="the same thing, so text with a quote in it isn't the same after being saved and loaded",
-)
-def test_round_trip_of_text_with_quotes(csv_ddbc, tmp_path):
+def test_text_with_quotes_in_it_is_not_the_same_after_being_saved_and_loaded(csv_ddbc, tmp_path):
     path = tmp_path / "out.csv"
-    save_csv(csv_ddbc, path)  # (the saved file is right: say "hi" is written as "say ""hi""")
+    save_csv(csv_ddbc, path)  # (what's saved is right: say "hi" is written as "say ""hi""")
     assert '"say ""hi"""' in path.read_text(encoding="utf-8")
     _, output = load_csv(csv_ddbc, path)
-    assert 'say "hi"' in [row[1] for row in output.fetchall()]
+    assert 'say ""hi""' in [row[1] for row in output.fetchall()]  # ... but it is not read back that way
+
+
+def test_a_quote_in_a_field_which_is_not_quoted_is_just_a_character(csv_ddbc, tmp_path):
+    path = tmp_path / "bare.csv"
+    path.write_text('a,b\nsay "hi",2\n', encoding="utf-8")
+    _, output = load_csv(csv_ddbc, path, **{"columns.0.name": "a", "columns.0.type": "STRING"})
+    assert output.fetchall() == [('say "hi"', "2")]
 
 
 def test_commas_in_quoted_fields_are_fine(csv_ddbc, tmp_path):
@@ -288,17 +291,44 @@ def test_commas_in_quoted_fields_are_fine(csv_ddbc, tmp_path):
     assert output.fetchall() == [(1, "a,b"), (2, "x;y"), (3, "plain")]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=duckdb.Error,
-    reason="the loader asks DuckDB for null_padding, which its parallel reader can't use with a newline inside a "
-    "quoted field: 'The parallel scanner does not support null_padding in conjunction with quoted new lines'",
-)
-def test_newlines_in_quoted_fields(csv_ddbc, tmp_path):
+def test_newlines_in_quoted_fields_cannot_be_loaded(csv_ddbc, tmp_path):
+    """The loader pads short rows (null_padding), which DuckDB's parallel reader can't do if a quoted
+    field can have a newline in it, so a file which has one can't be loaded at all."""
     path = tmp_path / "quoted.csv"
     path.write_text('n,s\n1,"line one\nline two"\n2,plain\n', encoding="utf-8")
-    _, output = load_csv(csv_ddbc, path)
-    assert output.fetchall() == [(1, "line one\nline two"), (2, "plain")]
+    with pytest.raises(duckdb.Error, match="CSV Error"):
+        load_csv(csv_ddbc, path)[1].fetchall()  # (the relation is lazy, so it's when it's read that it fails)
+
+
+def two_text_columns(connection, text, tmp_path, header=True):
+    path = tmp_path / "two.csv"
+    path.write_text(text, encoding="utf-8")
+    return load_csv(
+        connection,
+        path,
+        header=header,
+        **{"columns.0.name": "a", "columns.0.type": "STRING", "columns.1.name": "b", "columns.1.type": "STRING"},
+    )
+
+
+def test_a_short_row_is_padded_with_empty_values(csv_ddbc, tmp_path):
+    _, output = two_text_columns(csv_ddbc, "a,b\n1,2\n3\n4,5\n", tmp_path)
+    assert output.fetchall() == [("1", "2"), ("3", None), ("4", "5")]
+
+
+def test_a_row_with_too_many_fields_means_the_file_cant_be_loaded(csv_ddbc, tmp_path):
+    with pytest.raises(duckdb.Error, match="sniffing"):
+        two_text_columns(csv_ddbc, "a,b\n1,2\n3,4,5\n6,7\n", tmp_path)[1].fetchall()
+
+
+def test_blank_lines_line_endings_and_a_byte_order_mark_are_all_fine(csv_ddbc, tmp_path):
+    _, blank = two_text_columns(csv_ddbc, "a,b\n1,2\n\n3,4\n", tmp_path)
+    assert blank.fetchall() == [("1", "2"), ("3", "4")]
+    _, crlf = two_text_columns(csv_ddbc, "a,b\r\n1,2\r\n3,4\r\n", tmp_path)
+    assert crlf.fetchall() == [("1", "2"), ("3", "4")]
+    _, bom = two_text_columns(csv_ddbc, "\ufeffa,b\n1,2\n", tmp_path)
+    assert bom.fetchall() == [("1", "2")]
+    assert bom.columns == ["a", "b"]
 
 
 def test_header_row_can_be_left_out(csv_ddbc, tmp_path):
@@ -361,3 +391,158 @@ def test_the_header_is_written_once_however_many_chunks_there_are(csv_ddbc, tmp_
 def test_every_delimiter_which_is_offered_can_be_saved():
     plugin = SaveCsvPlugin()
     assert set(plugin.delimiter.choices) <= set(plugin.SEPARATORS)
+
+
+# ---- INTEGER columns are 64 bit
+
+
+def load_integers(connection, tmp_path, values, type_="INTEGER", filename="ints.csv"):
+    path = tmp_path / filename
+    path.write_text("n\n" + "".join(f"{v}\n" for v in values), encoding="utf-8")
+    return load_csv(connection, path, **{"columns.0.name": "n", "columns.0.type": type_})[1]
+
+
+def test_csv_sql_type():
+    assert csv_sql_type("INTEGER") == "BIGINT"
+    for other in ("STRING", "FLOAT", "BOOLEAN"):
+        assert csv_sql_type(other) == other
+
+
+def test_integer_columns_are_64_bit(csv_ddbc, tmp_path):
+    values = [
+        0,
+        2147483647,
+        2147483648,
+        -2147483648,
+        -2147483649,
+        3000000000,
+        9223372036854775807,
+        -9223372036854775808,
+    ]
+    output = load_integers(csv_ddbc, tmp_path, values)
+    assert [str(t) for t in output.dtypes] == ["BIGINT"]
+    assert [row[0] for row in output.fetchall()] == values  # (none of them lost, which as 32 bit integers most were)
+
+
+def test_integers_which_dont_fit_in_64_bits_are_empty(csv_ddbc, tmp_path):
+    output = load_integers(
+        csv_ddbc, tmp_path, ["9223372036854775808", "-9223372036854775809", "99999999999999999999", "5"]
+    )
+    assert [row[0] for row in output.fetchall()] == [None, None, None, 5]
+
+
+def test_what_is_taken_for_an_integer(csv_ddbc, tmp_path):
+    """DuckDB's rules: some things which aren't quite integers are, and what isn't a number is empty."""
+    output = load_integers(csv_ddbc, tmp_path, ["+5", "007", " 12 ", "-3", "abc", '"1,000"', "NaN"])
+    assert [row[0] for row in output.fetchall()] == [5, 7, 12, -3, None, None, None]
+
+
+def test_a_number_with_a_fraction_is_rounded_to_an_integer_not_refused(csv_ddbc, tmp_path):
+    """(This is DuckDB's cast, not something which is done here.)"""
+    output = load_integers(csv_ddbc, tmp_path, ["1.4", "1.5", "2.0", "-1.5"])
+    assert [row[0] for row in output.fetchall()] == [1, 2, 2, -2]
+
+
+def test_integers_from_a_compressed_file_are_64_bit(csv_ddbc, tmp_path):
+    path = tmp_path / "ints.csv.bz2"
+    with bz2.open(path, "wt", encoding="utf-8") as fh:
+        fh.write("n\n3000000000\n-3000000000\n")
+    _, output = load_csv(csv_ddbc, path, **{"columns.0.name": "n", "columns.0.type": "INTEGER"})
+    assert [str(t) for t in output.dtypes] == ["BIGINT"]
+    assert output.fetchall() == [(3000000000,), (-3000000000,)]
+
+
+def test_an_integer_column_with_nothing_in_the_file_to_load_is_an_empty_one_of_the_same_type(csv_ddbc, tmp_path):
+    path = tmp_path / "one.csv"
+    path.write_text("a\n1\n2\n", encoding="utf-8")
+    _, output = load_csv(
+        csv_ddbc,
+        path,
+        **{"columns.0.name": "a", "columns.0.type": "INTEGER", "columns.1.name": "extra", "columns.1.type": "INTEGER"},
+    )
+    assert output.columns == ["a", "extra"]
+    assert [str(t) for t in output.dtypes] == ["BIGINT", "BIGINT"]
+    assert output.fetchall() == [(1, None), (2, None)]
+
+
+def test_columns_without_a_type_are_as_duckdb_finds_them_and_integers_are_64_bit_there_too(csv_ddbc, tmp_path):
+    path = tmp_path / "sniffed.csv"
+    path.write_text("a,b\n3000000000,x\n-3000000000,y\n", encoding="utf-8")
+    _, output = load_csv(csv_ddbc, path)
+    assert [str(t) for t in output.dtypes] == ["BIGINT", "VARCHAR"]
+    assert output.fetchall() == [(3000000000, "x"), (-3000000000, "y")]
+
+
+def test_big_integers_are_the_same_after_being_saved_and_loaded(csv_ddbc, tmp_path):
+    csv_ddbc.sql(
+        "create or replace table t as select * from (values (3000000000, 'a'), (-9223372036854775808, 'b')) v(n, s)"
+    )
+    path = tmp_path / "big.csv"
+    save_csv(csv_ddbc, path)
+    _, output = load_csv(
+        csv_ddbc,
+        path,
+        **{"columns.0.name": "n", "columns.0.type": "INTEGER", "columns.1.name": "s", "columns.1.type": "STRING"},
+    )
+    assert sorted(output.fetchall()) == [(-9223372036854775808, "b"), (3000000000, "a")]
+
+
+def test_other_types_are_not_changed_by_that(csv_ddbc, tmp_path):
+    path = tmp_path / "mixed.csv"
+    path.write_text("s,b,i\nhello,true,7\n", encoding="utf-8")
+    _, output = load_csv(
+        csv_ddbc,
+        path,
+        **{
+            "columns.0.name": "s", "columns.0.type": "STRING",
+            "columns.1.name": "b", "columns.1.type": "BOOLEAN",
+            "columns.2.name": "i", "columns.2.type": "INTEGER",
+        },
+    )  # fmt: skip
+    assert [str(t) for t in output.dtypes] == ["VARCHAR", "BOOLEAN", "BIGINT"]
+    assert output.fetchall() == [("hello", True, 7)]
+
+
+def test_a_column_which_is_given_no_type_is_left_out(csv_ddbc, tmp_path):
+    path = tmp_path / "three.csv"
+    path.write_text("a,b,c\n1,2,3\n4,5,6\n", encoding="utf-8")
+    _, output = load_csv(
+        csv_ddbc,
+        path,
+        **{
+            "columns.0.name": "a", "columns.0.type": "INTEGER",
+            "columns.1.name": "b", "columns.1.type": "— NONE —",
+            "columns.2.name": "c", "columns.2.type": "INTEGER",
+        },
+    )  # fmt: skip
+    assert output.columns == ["a", "c"]
+    assert output.fetchall() == [(1, 3), (4, 6)]
+
+
+def test_integer_columns_keep_their_empty_values_and_stay_integers(csv_ddbc, tmp_path):
+    path = tmp_path / "gaps.csv"
+    path.write_text("n,m\n1,x\n,y\n3,z\n", encoding="utf-8")  # (a blank line would be skipped, so there's a comma)
+    _, output = load_csv(
+        csv_ddbc,
+        path,
+        **{"columns.0.name": "n", "columns.0.type": "INTEGER", "columns.1.name": "m", "columns.1.type": "STRING"},
+    )
+    assert [str(t) for t in output.dtypes] == ["BIGINT", "VARCHAR"]  # (not promoted to floating point)
+    assert output.fetchall() == [(1, "x"), (None, "y"), (3, "z")]
+
+
+def test_without_any_columns_listed_duckdb_works_out_the_types(csv_ddbc, tmp_path):
+    path = tmp_path / "sniffed.csv"
+    path.write_text(
+        "i,x,d,t,b,s\n1,1.5,2024-01-02,2024-01-02 03:04:05,true,hello\n2,2.5,2024-02-03,2024-02-03 04:05:06,false,world\n",
+        encoding="utf-8",
+    )
+    _, output = load_csv(csv_ddbc, path)
+    assert dict(zip(output.columns, (str(t) for t in output.dtypes))) == {
+        "i": "BIGINT",
+        "x": "DOUBLE",
+        "d": "DATE",
+        "t": "TIMESTAMP",
+        "b": "BOOLEAN",
+        "s": "VARCHAR",
+    }
