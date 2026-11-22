@@ -187,7 +187,7 @@ def write_to_csv(source: DuckDBPyRelation, filename: str, sep: str, quoting: int
         # duckdb doesn't support this properly
         # https://github.com/duckdb/duckdb-python/discussions/491
         if filename.endswith(".gz"):
-            with gzip.open(filename, "w") as fh_gz:
+            with gzip.open(filename, "w", compresslevel=6) as fh_gz:
                 _write(fh_gz, sep=sep, quoting=quoting)
         else:
             with open(filename, "w", encoding="utf-8") as fh_open:
