@@ -1,4 +1,5 @@
 import logging
+import re
 from typing import Optional
 
 from duckdb import DuckDBPyConnection, DuckDBPyRelation
@@ -14,6 +15,17 @@ from countess.utils.duckdb import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def pivot_column_pattern(pivot_char: str, expand_col: str) -> str:
+    """The regular expression which matches the pivoted columns of `expand_col`, which are called something
+    like `value_~expand_col` (`~` being the pivot_char), and picks out the something.
+
+    The name of the column has to be escaped, as it can have anything in it, including characters (brackets, for a
+    start) which mean something else in a regular expression.  It has to match the whole name, or the columns of
+    "n" would match those of "n2" as well.  And a . has to be able to match a newline too, or a newline in the
+    value it picks out would cut off whatever's before it."""
+    return "(?s)^(.*)_" + re.escape(pivot_char + expand_col) + "$"
 
 
 class PivotPlugin(DuckdbSimplePlugin):
@@ -78,7 +90,13 @@ class PivotPlugin(DuckdbSimplePlugin):
         )
         group_str = ", ".join(duckdb_escape_identifier(ic) for ic in index_cols)
 
-        query_str = f"PIVOT {source.alias} ON {pivot_str} USING {using_str}"
+        # The PIVOT is of a table with just the columns which are used in it.  When there are no index columns
+        # there's no GROUP BY, and DuckDB then groups by all of the columns which are left over, so the ones which
+        # are dropped, which should be ignored, would make a row of the output for each different thing in them.
+        used_cols = list(dict.fromkeys(index_cols + pivot_cols + expand_cols))
+        used_str = ", ".join(duckdb_escape_identifier(uc) for uc in used_cols)
+
+        query_str = f"PIVOT (SELECT {used_str} FROM {source.alias}) ON {pivot_str} USING {using_str}"
         if group_str:
             query_str = f"{query_str} GROUP BY {group_str}"
 
@@ -90,11 +108,14 @@ class PivotPlugin(DuckdbSimplePlugin):
         project_str = ", ".join(
             ("COALESCE(" if self.default_0 and column_is_numeric[ec] else "")
             + "COLUMNS("
-            + duckdb_escape_literal("(.*)_" + pivot_char + ec)
+            + duckdb_escape_literal(pivot_column_pattern(pivot_char, ec))
             + ")"
             + (", 0)" if self.default_0 and column_is_numeric[ec] else "")
             + " AS "
-            + duckdb_escape_literal(ec + ("_" if self.short_names else "__") + r"\1")
+            # (the new name is a template in which \1 is what the pattern picks out, so a backslash of
+            # the column's own has to be escaped or DuckDB refuses it: "Backslashes must either be escaped
+            # or followed by a number")
+            + duckdb_escape_literal(ec.replace("\\", "\\\\") + ("_" if self.short_names else "__") + r"\1")
             for ec in expand_cols
         )
 
