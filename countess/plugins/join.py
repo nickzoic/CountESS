@@ -53,7 +53,7 @@ class JoinPlugin(DuckdbPlugin):
             self.inputs.add_row()
 
         for num, (label, source) in enumerate(sources.items()):
-            if source:
+            if source is not None:
                 logger.debug("JoinPlugin.execute_multi %d %s %s", num + 1, repr(label), source.alias)
                 self.inputs[num].label = f"Input {num+1}: {label}"
                 self.inputs[num].set_column_choices(
@@ -117,12 +117,14 @@ class JoinPlugin(DuckdbPlugin):
         if row_limit is not None:
             query += f" LIMIT {row_limit}"
 
-        logger.debug("JoinPlugin.execute_multi tables[0] %s %d", tables[0].alias, len(tables[0]))
-        logger.debug("JoinPlugin.execute_multi tables[1] %s %d", tables[1].alias, len(tables[1]))
+        # (not logging row counts here: len() of a relation runs the whole query, even if debug logging is off)
+        logger.debug("JoinPlugin.execute_multi tables %s", [table.alias for table in tables])
         logger.debug("JoinPlugin.execute_multi query %s", query)
 
         try:
             rel = ddbc.sql(query)
+            # DuckDB only finds out whether the join can be made (for example, whether the types of the join
+            # columns can be converted to each other) by running it, so this really does need to run it once.
             logger.debug("JoinPlugin.execute_multi output %d", len(rel))
             return rel
         except duckdb.ConversionException as exc:

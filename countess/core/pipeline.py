@@ -522,7 +522,7 @@ class PipelineGraph:
         sources = {n.name: _r(n) for n in node.parent_nodes}
         node.plugin.prepare_multi(cursor, sources)
         result = node.plugin.execute_multi(cursor, sources)
-        if result:
+        if result is not None:
             logger.debug("%s: saving table %s", threading.current_thread(), node.table_name)
             result.to_table(node.table_name)
         node.finished.set()
