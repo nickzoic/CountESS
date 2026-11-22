@@ -1,10 +1,14 @@
 import logging
 import re
+import secrets
 import string
 from functools import lru_cache
 from typing import Any, Iterable, Optional
 
+import duckdb
 from countess_variant_caller import TooManyVariationsException, classify_protein_variant, find_variant_string
+from duckdb import DuckDBPyConnection, DuckDBPyRelation
+from duckdb.sqltypes import DuckDBPyType
 from fqfa.constants.iupac.protein import AA_CODES
 
 from countess import VERSION
@@ -19,7 +23,7 @@ from countess.core.parameters import (
     StringCharacterSetParam,
     StringParam,
 )
-from countess.core.plugins import DuckdbParallelTransformPlugin, DuckdbSqlPlugin
+from countess.core.plugins import DuckdbSqlPlugin
 from countess.utils.duckdb import duckdb_escape_identifier, duckdb_escape_literal
 
 logger = logging.getLogger(__name__)
@@ -60,8 +64,15 @@ class ProteinVariantMultiParam(FramedMultiParam):
     output = StringParam("Output Column", "protein")
 
 
-class VariantPlugin(DuckdbParallelTransformPlugin):
-    """Turns a DNA sequence into a HGVS variant code"""
+class VariantPlugin(DuckdbSqlPlugin):
+    """Turns a DNA sequence into a HGVS variant code
+
+    Working out a variant is expensive (compared to everything else in a pipeline) and has to be done in
+    Python, and a typical experiment has the same sequence over and over again, so rather than calling
+    `transform` for every row this works out each distinct combination of sequence, reference and offsets
+    only once, in a UDF, and then joins the results back to the rows they belong to.  The UDF only ever sees the
+    columns it needs, not the whole row.
+    """
 
     name = "Variant Caller"
     description = "Turns a DNA sequence into a HGVS variant code"
@@ -77,6 +88,8 @@ class VariantPlugin(DuckdbParallelTransformPlugin):
 
     drop = BooleanParam("Drop unmatched rows", False)
     drop_columns = BooleanParam("Drop Sequence / Reference Columns", False)
+
+    function_name: Optional[str] = None
 
     @lru_cache(maxsize=10000)
     def find_variant_string_cached(self, *a, **k):
@@ -96,6 +109,8 @@ class VariantPlugin(DuckdbParallelTransformPlugin):
             return []
 
     def transform(self, data: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Call the variants for a single row, given as a dict of column name to value.  Returns that dict
+        with the output columns added, or None if there's nothing to call."""
         sequence = data[str(self.column)]
         reference = self.reference.get_value_from_dict(data)
         if not sequence or not reference:
@@ -151,6 +166,117 @@ class VariantPlugin(DuckdbParallelTransformPlugin):
                 del data[reference_column_name]
 
         return data
+
+    def output_fields(self) -> list[str]:
+        """Names of the columns which this plugin calculates (some can be turned off by leaving the name blank)"""
+        return [name for name in self.add_fields() if name]
+
+    def call(self, sequence: str, reference: str, dna_offset: int, protein_offset: int) -> Optional[dict[str, Any]]:
+        """The UDF: `transform` for one distinct set of inputs, returning only the calculated columns.
+        The offset and reference are only looked at if they come from a column, otherwise `transform`
+        uses the constant from the plugin's parameters."""
+
+        data: dict[str, Any] = {self.column.value: sequence}
+        if reference_column := self.reference.get_column_name():
+            data[reference_column] = reference
+        if dna_offset_column := self.variant.offset.get_column_name():
+            data[dna_offset_column] = dna_offset
+        if protein_offset_column := self.protein.offset.get_column_name():
+            data[protein_offset_column] = protein_offset
+
+        try:
+            result = self.transform(data)
+        except RuntimeError as exc:
+            logger.warning(str(exc))
+            return None
+
+        return {name: result.get(name) for name in self.output_fields()} if result is not None else None
+
+    def execute(
+        self, ddbc: DuckDBPyConnection, source: DuckDBPyRelation, row_limit: Optional[int] = None
+    ) -> Optional[DuckDBPyRelation]:
+        outputs = self.output_fields()
+        if outputs:
+            self.function_name = "f_" + secrets.token_hex(16)
+            logger.debug("VariantPlugin creating function %s for plugin %s", self.function_name, self.name)
+            ddbc.create_function(  # type: ignore[call-overload]
+                self.function_name,
+                self.call,
+                parameters=[
+                    DuckDBPyType("VARCHAR"),
+                    DuckDBPyType("VARCHAR"),
+                    DuckDBPyType("BIGINT"),
+                    DuckDBPyType("BIGINT"),
+                ],
+                return_type=duckdb.struct_type({name: DuckDBPyType("VARCHAR") for name in outputs}),
+            )
+        return super().execute(ddbc, source, row_limit)
+
+    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[str]:
+        columns = list(columns)
+        outputs = self.output_fields()
+        removed = {c for c in self.remove_fields(columns) if c}
+        kept_columns = [c for c in columns if c not in removed]
+
+        if not outputs:
+            return f"SELECT {', '.join(duckdb_escape_identifier(c) for c in kept_columns) or '*'} FROM {table_name}"
+
+        # The inputs to the UDF.  Anything which is a constant (the reference, perhaps the offsets) isn't
+        # part of the key, as it's the same for every row, and `call` doesn't look at it.
+        sequence_expr = f"CAST(S.{duckdb_escape_identifier(self.column.value)} AS VARCHAR)"
+        keys = {"k_sequence": sequence_expr}
+        args = {"k_sequence": "k_sequence", "k_reference": "''", "k_dna_offset": "0", "k_protein_offset": "0"}
+
+        if reference_column := self.reference.get_column_name():
+            keys["k_reference"] = f"CAST(S.{duckdb_escape_identifier(reference_column)} AS VARCHAR)"
+        if dna_offset_column := self.variant.offset.get_column_name():
+            keys["k_dna_offset"] = f"COALESCE(CAST(S.{duckdb_escape_identifier(dna_offset_column)} AS BIGINT), 0)"
+        if protein_offset_column := self.protein.offset.get_column_name():
+            keys[
+                "k_protein_offset"
+            ] = f"COALESCE(CAST(S.{duckdb_escape_identifier(protein_offset_column)} AS BIGINT), 0)"
+        for key in keys:
+            args[key] = key
+
+        # There's nothing to call if there's no sequence or no reference (see `transform`): those rows
+        # don't match anything in the join, so the whole row comes out NULL, as it always has.
+        nothing_to_call = [f"({keys['k_sequence']} IS NOT NULL AND {keys['k_sequence']} != '')"]
+        if "k_reference" in keys:
+            nothing_to_call.append(f"({keys['k_reference']} IS NOT NULL AND {keys['k_reference']} != '')")
+        elif not self.reference.get_value_from_dict({}):
+            nothing_to_call.append("FALSE")
+
+        key_select = ", ".join(f"{expr} AS {key}" for key, expr in keys.items())
+        join_on = " AND ".join(f"{expr} = C.{key}" for key, expr in keys.items())
+
+        # Output columns replace input columns of the same name where there are any, otherwise they
+        # go at the end.
+        called = {name: f"struct_extract(C._result, {duckdb_escape_literal(name)})" for name in outputs}
+
+        def select_column(column: str) -> str:
+            column_id = duckdb_escape_identifier(column)
+            if column in called:
+                return f"{called[column]} AS {column_id}"
+            # (no match in the join means there was nothing to call, which blanks the whole row)
+            return f"CASE WHEN C.k_sequence IS NOT NULL THEN S.{column_id} END AS {column_id}"
+
+        select_list = [select_column(c) for c in kept_columns]
+        select_list += [
+            f"{expr} AS {duckdb_escape_identifier(name)}" for name, expr in called.items() if name not in kept_columns
+        ]
+        udf_args = ", ".join(args[k] for k in ("k_sequence", "k_reference", "k_dna_offset", "k_protein_offset"))
+
+        return f"""
+            WITH _source AS MATERIALIZED (
+                SELECT * FROM {table_name}
+            ), _keys AS (
+                SELECT DISTINCT {key_select} FROM _source AS S WHERE {' AND '.join(nothing_to_call)}
+            ), _called AS (
+                SELECT *, {self.function_name}({udf_args}) AS _result FROM _keys
+            )
+            SELECT {', '.join(select_list)}
+            FROM _source AS S LEFT JOIN _called AS C ON {join_on}
+        """
 
 
 class VariantClassifier(DuckdbSqlPlugin):
