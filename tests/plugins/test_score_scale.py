@@ -87,9 +87,11 @@ def test_both_classes_in_the_same_place_give_nan_and_infinity_not_an_error(ddbc,
 
 
 def test_scaled_within_groups(ddbc, make_source, assert_rows):
-    source = make_source("""select * from (values
+    source = make_source(
+        """select * from (values
             ('g1', 'syn', 1.0), ('g1', 'syn', 3.0), ('g1', 'non', 5.0), ('g1', 'mis', 4.0),
-            ('g2', 'syn', 10.0), ('g2', 'non', 30.0), ('g2', 'mis', 20.0)) t(g, v, score)""")
+            ('g2', 'syn', 10.0), ('g2', 'non', 30.0), ('g2', 'mis', 20.0)) t(g, v, score)"""
+    )
     _, output = scale(ddbc, source, ("Avg", "v", "Equals", "syn"), ("Avg", "v", "Equals", "non"), group="g")
     # g1 scales 2 -> 0 and 5 -> 1, g2 scales 10 -> 0 and 30 -> 1
     assert_rows(

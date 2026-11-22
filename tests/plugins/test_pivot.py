@@ -323,9 +323,11 @@ def test_any_column_names_at_all(ddbc, set_columns):
 
 
 def wide_table(make_source):
-    return make_source("""select * from (values
+    return make_source(
+        """select * from (values
             ('g1', 'r1', 10, 'a', 1.5, true), ('g1', 'r2', 20, 'b', 2.5, false), ('g2', 'r1', 5, NULL, NULL, true),
-            ('g3', 'r2', 7, 'd', 3.5, NULL)) t(gene, rep, n, note, score, flag)""")
+            ('g3', 'r2', 7, 'd', 3.5, NULL)) t(gene, rep, n, note, score, flag)"""
+    )
 
 
 def test_dropped_columns_of_any_kind_make_no_difference_without_an_index_column(ddbc, make_source, set_columns):
