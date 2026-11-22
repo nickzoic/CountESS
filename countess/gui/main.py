@@ -120,7 +120,7 @@ class ConfiguratorWrapper:
     RESULT_POLL_MS = 250  # how often to check if a node has finished calculating
     PREVIEW_POLL_MS = 100  # how often to check if there's a result to show a preview of
 
-    def __init__(self, tk_parent, node, ddbc, change_callback):
+    def __init__(self, tk_parent: tk.Widget, node: PipelineNode, ddbc, change_callback):
         logger.debug("ConfiguratorWrapper %s %s", node.name, node.uuid)
         self.node = node
         self.ddbc = ddbc
@@ -472,7 +472,7 @@ class LoggerFrame(tk.Frame):
 
         self.logging_event()
 
-    def logging_event(self, ev=None):
+    def logging_event(self, ev=None) -> None:
         """Show whatever's arrived on the log queue.  Called regularly from the Tk
         event loop, it works through the queue for a short time (so the GUI stays
         responsive even if something is logging thousands of messages) and adds
