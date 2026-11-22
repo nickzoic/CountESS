@@ -137,6 +137,15 @@ def csv_cast_sql(value_sql: str, choice: str, size: Optional[Tuple[int, int]] = 
         # (it needs room for all the digits of the part before the exponent as well, and without it the
         # number is a NULL, which in a test was one in ten of them), so those are put in a wide DECIMAL of the
         # same scale first.  That's much slower, hence only for the ones which have an exponent.
+        #
+        # XXX This is a work-around for a bug in DuckDB, so CHECK WHETHER IT'S BEEN FIXED YET:
+        #     https://github.com/duckdb/duckdb/issues/29189
+        # and if it has, take out `via_wide` and the CASE (and keep the tests, they'll show it's still right).
+        # That issue is about a width which is the same as the scale, where it's one digit short, but what was
+        # found is that the cast needs room for (the digits before the point) + (the scale), as the number was
+        # written, so 7642656515e-5 is a NULL as a DECIMAL(10,5) though it fits, and is five digits short, and
+        # the work-around has a limit too: it fails when those add up to more than 38.  So when it's fixed,
+        # check that those are, as well as 1e-5 as a DECIMAL(5,5), before taking this out.
         via_wide = (
             f"TRY_CAST(TRY_CAST({value_sql} as DECIMAL({DECIMAL_MAX_DIGITS},{scale})) as DECIMAL({width},{scale}))"
         )
