@@ -1,6 +1,26 @@
 import gc
+import os
 
+import duckdb
 import pytest
+
+# DuckDB uses as many threads as the computer has cores.  That makes no difference to most things, but it does to
+# some: how a write which fails part way through is left, and the order which rows come out in when nothing says
+# which.  Those can't be seen on a computer with one core, and a test run there passes where one on a
+# computer with several fails, as the checks which run on GitHub do.  So
+#
+#     COUNTESS_TEST_DUCKDB_THREADS=4 pytest
+#
+# runs the tests as if on a computer with four cores, wherever they are.
+if os.environ.get("COUNTESS_TEST_DUCKDB_THREADS"):
+    _real_connect = duckdb.connect
+
+    def _connect_with_threads(*args, **kwargs):
+        connection = _real_connect(*args, **kwargs)
+        connection.execute(f"SET threads = {int(os.environ['COUNTESS_TEST_DUCKDB_THREADS'])}")
+        return connection
+
+    duckdb.connect = _connect_with_threads
 
 
 @pytest.fixture(autouse=True)
