@@ -29,7 +29,6 @@ dependencies = [
     'pyPEG2~=2.15.2',
     'pytz~=2026.6',
     'rapidfuzz~=3.14.5',
-    'statsmodels~=0.14.6',
     'typing_extensions~=4.15.0',
 ]
 
@@ -49,6 +48,7 @@ dev = [
     'pytest~=8.4.2',
     'pytest-socket~=0.7.0',
     'requests-mock~=1.12.1',
+    'scipy~=1.18.1',
 ]
 
 gui = [

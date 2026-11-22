@@ -1,10 +1,11 @@
 import math
+from fractions import Fraction
 
 import duckdb
 import numpy as np
 import pytest
 
-from countess.plugins.score import ScoringPlugin, _wls_slope, _wls_statsmodels, score_function
+from countess.plugins.score import ScoringPlugin, _wls_slope, score_function
 
 
 def wls_slope(times, counts, populations):
@@ -19,6 +20,19 @@ def wls_slope(times, counts, populations):
     residuals = y - x @ beta
     scale = (w * residuals**2).sum() / (len(times) - 2)
     return float(beta[0]), float(math.sqrt(scale * xtwx_inverse[0, 0]))
+
+
+def exact_wls_slope(xs, ys, ws):
+    """The same weighted least squares line as `_wls_slope` finds, but worked out in exact arithmetic (every float is
+    exactly a fraction), so that rounding can't hide anything however badly conditioned the problem is."""
+    xs, ys, ws = ([Fraction(v) for v in values] for values in (xs, ys, ws))
+    sw = sum(ws)
+    xbar = sum(w * x for w, x in zip(ws, xs)) / sw
+    ybar = sum(w * y for w, y in zip(ws, ys)) / sw
+    sxx = sum(w * (x - xbar) ** 2 for w, x in zip(ws, xs))
+    slope = sum(w * (x - xbar) * (y - ybar) for w, x, y in zip(ws, xs, ys)) / sxx
+    rss = sum(w * (y - slope * x - (ybar - slope * xbar)) ** 2 for w, x, y in zip(ws, xs, ys))
+    return float(slope), math.sqrt(float(rss / (len(xs) - 2) / sxx))
 
 
 def two_point(counts, populations):
@@ -58,33 +72,53 @@ def _wls_inputs(times, counts, populations):
     return times, ys, ws
 
 
-def test_closed_form_agrees_with_statsmodels_on_random_data():
-    """`_wls_slope` is a replacement for a statsmodels WLS fit, so check them against each other."""
+def test_closed_form_agrees_with_the_normal_equations_on_random_data():
     rng = np.random.default_rng(1)
     for _ in range(300):
         n = int(rng.integers(3, 13))
-        times = sorted(rng.uniform(0, 1, n))
-        populations = rng.integers(1, 2_000_000, n)
-        counts = np.minimum(populations, rng.poisson(rng.uniform(0, 50), n))
-        args = _wls_inputs(times, [int(c) for c in counts], [int(p) for p in populations])
-        assert _wls_slope(*args) == pytest.approx(_wls_statsmodels(*args), rel=1e-8, abs=1e-12)
+        times = [float(t) for t in sorted(rng.uniform(0, 1, n))]
+        populations = [int(p) for p in rng.integers(1, 2_000_000, n)]
+        counts = [int(min(p, c)) for p, c in zip(populations, rng.poisson(rng.uniform(0, 50), n))]
+        assert score_function(times, counts, populations) == pytest.approx(
+            wls_slope(times, counts, populations), rel=1e-8, abs=1e-12
+        )
 
 
 def test_closed_form_is_accurate_when_the_times_are_large_compared_to_their_spread():
-    times = [1e6 + i for i in range(5)]
-    args = _wls_inputs(times, [3, 8, 20, 41, 90], [1000] * 5)
-    assert _wls_slope(*args) == pytest.approx(_wls_statsmodels(*args), rel=1e-8)
+    """(Where working from the raw sums of w, wx, wxx etc instead of centred values is wrong in the fourth digit)"""
+    args = _wls_inputs([1e6 + i for i in range(5)], [3, 8, 20, 41, 90], [1000] * 5)
+    assert _wls_slope(*args) == pytest.approx(exact_wls_slope(*args), rel=1e-9)
 
 
 def test_closed_form_with_extreme_weights():
-    args = _wls_inputs([0.0, 0.25, 0.5, 0.75, 1.0], [0, 0, 0, 1, 0], [10**9] * 5)
-    assert _wls_slope(*args) == pytest.approx(_wls_statsmodels(*args), rel=1e-8)
+    times, counts, populations = [0.0, 0.25, 0.5, 0.75, 1.0], [0, 0, 0, 1, 0], [10**9] * 5
+    assert score_function(times, counts, populations) == pytest.approx(wls_slope(times, counts, populations), rel=1e-8)
+    args = _wls_inputs(times, counts, populations)
+    assert _wls_slope(*args) == pytest.approx(exact_wls_slope(*args), rel=1e-9)
 
 
-def test_identical_times_have_no_slope_of_their_own_so_it_is_left_to_statsmodels():
-    args = _wls_inputs([1.0, 1.0, 1.0], [1, 5, 9], [100, 100, 100])
-    assert _wls_slope(*args) == pytest.approx(_wls_statsmodels(*args))
-    assert score_function([1.0, 1.0, 1.0], [1, 5, 9], [100, 100, 100]) == pytest.approx(_wls_statsmodels(*args))
+def is_nan_pair(result):
+    return len(result) == 2 and all(math.isnan(v) for v in result)
+
+
+def test_identical_times_have_no_slope():
+    assert is_nan_pair(_wls_slope(*_wls_inputs([1.0, 1.0, 1.0], [1, 5, 9], [100, 100, 100])))
+    assert is_nan_pair(score_function([1.0, 1.0, 1.0], [1, 5, 9], [100, 100, 100]))
+
+
+@pytest.mark.parametrize("n", [0, 1])
+def test_fewer_than_two_points_have_no_slope(n):
+    assert is_nan_pair(_wls_slope([1.0] * n, [0.0] * n, [1.0] * n))
+
+
+def test_points_with_no_weight_have_no_slope():
+    assert is_nan_pair(_wls_slope([0.0, 0.5, 1.0], [1.0, 2.0, 3.0], [0.0, 0.0, 0.0]))
+
+
+def test_two_points_have_a_slope_but_nothing_left_over_to_estimate_its_error_from():
+    slope, sigma = _wls_slope([0.0, 2.0], [1.0, 5.0], [1.0, 3.0])
+    assert slope == pytest.approx(2.0)
+    assert math.isnan(sigma)
 
 
 def test_a_variant_which_gets_more_common_scores_positive_and_one_which_dies_out_negative():
@@ -184,6 +218,13 @@ def test_time_points_which_are_not_numbers_are_in_order_of_name(ddbc, make_sourc
         output,
         [(name, *counts, *wls_slope([0.0, 0.5, 1.0], counts, POPULATION)) for name, counts in COUNTS.items()],
     )
+
+
+def test_time_points_which_are_all_the_same_give_a_null_score_not_an_error(ddbc, make_source):
+    """(The score function gives NaN for these, which DuckDB turns into NULL when it comes out of the function)"""
+    source = make_source("select * from (values ('v1', 10, 20, 40)) t(name, count_1, \"count_1.0\", count_01)")
+    _, output = score(ddbc, source)
+    assert output.fetchall() == [("v1", 10, 20, 40, None, None)]
 
 
 def test_output_columns_can_be_named(ddbc, make_source):
