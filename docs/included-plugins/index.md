@@ -249,7 +249,9 @@ Performs a "pivot" operation on the data table.
 
 Each column can be specified as an "Index", "Pivot" or "Expand" column, or dropped.
 
-The result will have one row per Index value, with each of the "Expand" columns expanded to include each distinct value of the "Pivot" column(s).  Duplicate values are summed and missing values are set to `0`.
+The result will have one row per Index value, with each of the "Expand" columns expanded to include each distinct value of the "Pivot" column(s).  If no column is an Index column the result is a single row.  A column which is dropped has no effect at all on the result, whatever is in it.  The names of the columns, and the values in the Pivot columns, can have any characters in them.
+
+Duplicate values are combined with the Aggregation Function, which is `sum` unless it is changed.  A combination which doesn't occur in the data is empty, or `0` if "Default value 0?" is set.  The output columns are called `expand-column__pivot-column_value`, or `expand-column_value` if "Short Output Names?" is set.
 
 For example this data set:
 
