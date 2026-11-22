@@ -38,8 +38,6 @@ class RegexToolPlugin(DuckdbSimplePlugin):
     def execute(
         self, ddbc: DuckDBPyConnection, source: DuckDBPyRelation, row_limit: Optional[int] = None
     ) -> Optional[DuckDBPyRelation]:
-        column = Id(self.column.value)
-        pattern = Lit(self.regex.value)
         outputs = [o for o in self.output if o.name.value]
 
         proj: Fragment
@@ -47,6 +45,15 @@ class RegexToolPlugin(DuckdbSimplePlugin):
             proj = join(Id(c) for c in source.columns if c != self.column.value)
         else:
             proj = Raw("*")
+
+        if not (outputs or self.drop_unmatch):
+            # nothing which follows needs the column or the pattern, so there's no need for them to have been
+            # chosen yet (and until they have, the tool just passes everything on)
+            logger.debug("RegexToolPlugin proj %s", proj)
+            return source.project(str(proj))
+
+        column = Id(self.column.value)
+        pattern = Lit(self.regex.value)
 
         if outputs:
             extract = Sql.template(
