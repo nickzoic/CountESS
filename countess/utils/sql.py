@@ -32,7 +32,7 @@ import logging
 import math
 import re
 import string
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -71,9 +71,10 @@ class Raw(Fragment):
 
 
 class Id(Fragment):
-    """The name of a table, column or alias, which is always quoted, so it can be anything DuckDB allows."""
+    """The name of a table, column or alias, which is always quoted, so it can be anything DuckDB allows.  None is
+    for a name which hasn't been chosen yet, and is an SqlError."""
 
-    def __init__(self, name: str):
+    def __init__(self, name: Optional[str]):
         if name is None:
             raise SqlError("there's no name for this identifier (a column which hasn't been chosen yet?)")
         if not isinstance(name, str):
@@ -106,7 +107,7 @@ _TYPE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_ ]*(\(\s*\d+\s*(,\s*\d+\s*)?\))?(\
 class Fn(Fragment):
     """The name of a function, or a keyword such as an aggregation like SUM.  It has to look like one."""
 
-    def __init__(self, name: str):
+    def __init__(self, name: Optional[str]):
         if not isinstance(name, str) or not _FUNCTION_NAME.fullmatch(name):
             raise SqlError(f"{name!r} isn't the name of a function")
         super().__init__(name)
@@ -115,7 +116,7 @@ class Fn(Fragment):
 class Type(Fragment):
     """The name of a type, such as BIGINT, DECIMAL(10,2), TIMESTAMP WITH TIME ZONE or INTEGER[]."""
 
-    def __init__(self, name: str):
+    def __init__(self, name: Optional[str]):
         if not isinstance(name, str) or not _TYPE_NAME.fullmatch(name.strip()):
             raise SqlError(f"{name!r} isn't the name of a type: use Raw if it's one of the unusual ones")
         # (spaces made single, and none round brackets or commas, so `DECIMAL (10, 2)` is `DECIMAL(10,2)`)

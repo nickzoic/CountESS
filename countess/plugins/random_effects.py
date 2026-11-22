@@ -12,7 +12,7 @@ from countess.core.parameters import (
     NumericColumnGroupChoiceParam,
 )
 from countess.core.plugins import DuckdbParallelTransformPlugin, DuckdbSqlPlugin
-from countess.utils.duckdb import duckdb_escape_identifier
+from countess.utils.sql import Fn, Id, Sql, join
 
 logger = logging.getLogger(__name__)
 
@@ -148,29 +148,41 @@ class RandomEffectsPlugin2(DuckdbSqlPlugin):
                 null_handling="special",
             )
 
-    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[str]:
+    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[Sql]:
+        table = Id(table_name)
         if not (self.score_col.value and self.sigma_col.value):
-            return f"select * from {table_name}"
+            return Sql.template("SELECT * FROM {table}", table=table)
 
-        score_col = duckdb_escape_identifier(self.score_col.value)
-        sigma_col = duckdb_escape_identifier(self.sigma_col.value)
+        score_col = Id(self.score_col.value)
+        sigma_col = Id(self.sigma_col.value)
+        function = Fn(self.function_name)
 
         if self.group_cols.get_values():
-            group_cols = ",".join(duckdb_escape_identifier(c) for c in self.group_cols.get_values())
-            return f"""
+            group_cols = join(Id(c) for c in sorted(self.group_cols.get_values()))
+            return Sql.template(
+                """
                 SELECT {group_cols}, _ROW[1] AS score, _ROW[2] AS sigma, _COUNT AS count
                 FROM (
-                    SELECT {group_cols},
-                      {self.function_name}(LIST({score_col}), LIST({sigma_col})) as _ROW,
-                      COUNT(*) AS _COUNT
-                    FROM {table_name} GROUP BY {group_cols}
+                    SELECT {group_cols}, {function}(LIST({score_col}), LIST({sigma_col})) AS _ROW, COUNT(*) AS _COUNT
+                    FROM {table} GROUP BY {group_cols}
                 ) X
+                """,
+                group_cols=group_cols,
+                function=function,
+                score_col=score_col,
+                sigma_col=sigma_col,
+                table=table,
+            )
+        return Sql.template(
             """
-        else:
-            return f"""
-                 SELECT _ROW[1] AS score, _ROW[2] AS sigma, _COUNT AS count
-                 FROM (
-                     SELECT {self.function_name}(LIST({score_col}), LIST({sigma_col})) AS _ROW, COUNT(*) AS _COUNT
-                     FROM {table_name}
-                 )
-            """
+            SELECT _ROW[1] AS score, _ROW[2] AS sigma, _COUNT AS count
+            FROM (
+                SELECT {function}(LIST({score_col}), LIST({sigma_col})) AS _ROW, COUNT(*) AS _COUNT
+                FROM {table}
+            )
+            """,
+            function=function,
+            score_col=score_col,
+            sigma_col=sigma_col,
+            table=table,
+        )
