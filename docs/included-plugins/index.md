@@ -108,9 +108,9 @@ Parquet is a compact binary format which records the type of every column, so un
 as integers, and keeps nulls and text distinct, and is much faster to read back in again.  It is understood by
 most data analysis software (pandas, R, Spark, DuckDB and so on).
 
-Nothing is written while the data is only being previewed.  If the file already exists it is
-replaced only once the new one has been written successfully, so a problem part way through leaves the
-old file as it was.
+Nothing is written while the data is only being previewed.  The file is written under a temporary name, in the
+same directory, and only moved to its proper name once all of it has been written successfully, so a problem part
+way through leaves any old file as it was, and doesn't leave a part of a new one.
 
 *Note that Parquet can't store 128 bit integers, which is what totals of integer columns (for example from the Group By plugin) are made by DuckDB.  Those columns are written as 64 bit integers.  A value too large for that is an error rather than being written inexactly.*
 

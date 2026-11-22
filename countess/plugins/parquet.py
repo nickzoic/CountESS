@@ -17,6 +17,7 @@ from countess.core.parameters import (
 )
 from countess.core.plugins import DuckdbLoadFileWithTheLotPlugin, DuckdbSaveFilePlugin
 from countess.utils.duckdb import duckdb_escape_identifier
+from countess.utils.files import atomic_output
 
 PARQUET_FILE_TYPES: Sequence[Tuple[str, Union[str, List[str]]]] = [
     ("Parquet", [".parquet", ".pq"]),
@@ -117,6 +118,10 @@ class SaveParquetPlugin(DuckdbSaveFilePlugin):
         Path(filename).parent.mkdir(parents=True, exist_ok=True)
         logger.debug("SaveParquetPlugin.execute writing file %s", filename)
 
-        # DuckDB writes to a temporary file if there's already a file of that name, so
-        # something which goes wrong part way through leaves the old file as it was.
-        source.to_parquet(filename, compression=self.compression.value.lower())
+        # It's written to a temporary file which takes the place of the file when it's all been written, so
+        # something which goes wrong part way through leaves the old file as it was and leaves nothing else.
+        # (DuckDB does something like it for a file which already exists, but when the write fails with more
+        # than one thread, which it does on any computer with more than one core, it leaves that file behind,
+        # and when there was no file already it leaves a part of one.)
+        with atomic_output(filename) as temp_filename:
+            source.to_parquet(temp_filename, compression=self.compression.value.lower())

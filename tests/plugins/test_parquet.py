@@ -305,25 +305,63 @@ def test_columns_which_are_fine_are_left_alone(ddbc, source, tmp_path):
 # ---- what happens if saving goes wrong
 
 
+@pytest.fixture(name="threaded_ddbc", params=[1, 4], ids=["1 thread", "4 threads"])
+def fixture_threaded_ddbc(request):
+    """A connection which uses one thread or several whatever the computer has: DuckDB uses as many as there are
+    cores, which makes no difference to most things, but how a failing write is left does depend on it, and a
+    computer with only one core would never find that out."""
+    connection = duckdb.connect()
+    connection.execute(f"SET threads = {request.param}")
+    yield connection
+    connection.close()
+
+
 def failing_source(ddbc):
     ddbc.sql("create or replace table big as select range::bigint as n from range(400000)")
     return ddbc.sql("select case when n = 350000 then error('boom') else n end as n from big")
 
 
-def test_failure_leaves_the_existing_file_alone(ddbc, tmp_path):
+def test_failure_leaves_the_existing_file_alone(threaded_ddbc, tmp_path):
     path = tmp_path / "out.parquet"
-    write_parquet(ddbc, path, "select 1 as keep_me")
+    write_parquet(threaded_ddbc, path, "select 1 as keep_me")
     original = path.read_bytes()
     with pytest.raises(duckdb.Error):
-        save(ddbc, failing_source(ddbc), path)
+        save(threaded_ddbc, failing_source(threaded_ddbc), path)
     assert path.read_bytes() == original
     assert os.listdir(tmp_path) == ["out.parquet"]  # and no half written file left over
 
 
-def test_failure_does_not_leave_a_partial_new_file(ddbc, tmp_path):
+def test_failure_does_not_leave_a_partial_new_file(threaded_ddbc, tmp_path):
     with pytest.raises(duckdb.Error):
-        save(ddbc, failing_source(ddbc), tmp_path / "new.parquet")
+        save(threaded_ddbc, failing_source(threaded_ddbc), tmp_path / "new.parquet")
     assert os.listdir(tmp_path) == []
+
+
+def test_a_save_which_works_leaves_nothing_but_the_file(threaded_ddbc, tmp_path):
+    path = tmp_path / "sub" / "out.parquet"
+    threaded_ddbc.sql("create table big as select range::bigint as n from range(400000)")
+    save(threaded_ddbc, threaded_ddbc.table("big"), path)
+    assert os.listdir(tmp_path / "sub") == ["out.parquet"]
+    assert threaded_ddbc.sql(f"select count(*), max(n) from read_parquet('{path}')").fetchone() == (400000, 399999)
+
+
+def test_saving_over_an_existing_file_replaces_it_whole(threaded_ddbc, tmp_path):
+    path = tmp_path / "out.parquet"
+    write_parquet(threaded_ddbc, path, "select 1 as old_column")
+    threaded_ddbc.sql("create table big as select range::bigint as n from range(400000)")
+    save(threaded_ddbc, threaded_ddbc.table("big"), path)
+    assert os.listdir(tmp_path) == ["out.parquet"]
+    assert threaded_ddbc.sql(f"select count(*) from read_parquet('{path}')").fetchone() == (400000,)
+    assert threaded_ddbc.sql(f"select * from read_parquet('{path}') limit 0").columns == ["n"]
+
+
+def test_a_failure_to_put_the_file_in_place_leaves_nothing_behind_either(ddbc, tmp_path):
+    """(If there's a directory where the file should go, which it can't replace.)"""
+    (tmp_path / "out.parquet").mkdir()
+    ddbc.sql("create table t as select 1 as n")
+    with pytest.raises(OSError):
+        save(ddbc, ddbc.table("t"), tmp_path / "out.parquet")
+    assert os.listdir(tmp_path) == ["out.parquet"] and (tmp_path / "out.parquet").is_dir()
 
 
 # ---- both together
