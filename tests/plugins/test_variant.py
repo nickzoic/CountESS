@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from countess.plugins.variant import VariantClassifier, VariantPlugin
+from countess.plugins.variant import VariantClassifier, VariantConverter, VariantPlugin
 from countess.utils.duckdb import duckdb_escape_literal
 
 
@@ -131,3 +131,264 @@ def test_classifier(variant, expected, warnings_expected):
     value = ddbc.sql("select variant_type from test2").fetchone()[0]
     assert value == expected
     assert len(warnings) == warnings_expected
+
+
+# ---- more of the variant caller
+
+# a reference of  Met Ala Lys Stop  to make protein calls against
+REFERENCE = "ATGGCTAAATAG"
+
+
+def variant_plugin(**params):
+    plugin = VariantPlugin()
+    plugin.set_parameter("column", "seq")
+    plugin.set_parameter("reference", REFERENCE)
+    for key, value in params.items():
+        plugin.set_parameter(key, value)
+    plugin.set_column_choices({"seq": False, "ref": False})
+    return plugin
+
+
+@pytest.mark.parametrize(
+    "sequence,dna,protein,classification",
+    [
+        ("ATGGCTAAATAG", "g.=", "p.=", "W"),  # nothing different
+        ("ATGGTTAAATAG", "g.5C>T", "p.Ala2Val", "M"),  # a missense change
+        ("ATGGCCAAATAG", "g.6T>C", "p.Ala2=", "S"),  # a different codon for the same amino acid
+        ("ATGGCTTAATAG", "g.7A>T", "p.Lys3Ter", "N"),  # a stop codon
+        ("ATGGCTAAA", "g.10_12del", "p.Ter4del", "D"),  # (it's not got a stop codon any more)
+        ("atggttaaatag", "g.5C>T", "p.Ala2Val", "M"),  # (the case doesn't matter)
+    ],
+)
+def test_dna_protein_and_classification(sequence, dna, protein, classification):
+    result = variant_plugin().transform({"seq": sequence})
+    assert (result["variant"], result["protein"], result["class"]) == (dna, protein, classification)
+    assert result["seq"] == sequence  # (the input is kept)
+
+
+def test_prefixes_and_output_names():
+    plugin = variant_plugin(
+        **{
+            "variant.prefix": "NC_1",
+            "variant.output": "hgvs_dna",
+            "protein.prefix": "ENSP2",
+            "protein.output": "hgvs_protein",
+            "classify": "kind",
+        }
+    )
+    result = plugin.transform({"seq": "ATGGTTAAATAG"})
+    assert result == {
+        "seq": "ATGGTTAAATAG",
+        "hgvs_dna": "NC_1:g.5C>T",
+        "hgvs_protein": "ENSP2:p.Ala2Val",
+        "kind": "M",
+    }
+    assert plugin.add_fields() == {"hgvs_dna": str, "hgvs_protein": str, "kind": str}
+
+
+def test_dna_variant_types():
+    for seq_type, expected in (("g", "g.5C>T"), ("c", "c.5C>T"), ("n", "n.5C>T")):
+        assert (
+            variant_plugin(**{"variant.seq_type": seq_type}).transform({"seq": "ATGGTTAAATAG"})["variant"] == expected
+        )
+
+
+@pytest.mark.parametrize("sequence", ["", None])
+def test_no_sequence_gives_nothing(sequence):
+    assert variant_plugin().transform({"seq": sequence}) is None
+
+
+def test_no_reference_gives_nothing():
+    plugin = variant_plugin(reference="— ref")  # (a reference taken from a column, which is empty)
+    assert plugin.transform({"seq": "ATGGCTAAATAG", "ref": ""}) is None
+    assert plugin.transform({"seq": "ATGGCTAAATAG", "ref": None}) is None
+    assert plugin.transform({"seq": "ATGGTTAAATAG", "ref": REFERENCE})["variant"] == "g.5C>T"
+
+
+def test_a_sequence_which_cant_be_compared_gives_nulls_and_a_warning(caplog):
+    with caplog.at_level("WARNING"):
+        result = variant_plugin().transform({"seq": "ATGNCTAAATAG"})  # (N isn't a base)
+    assert (result["variant"], result["protein"], result["class"]) == (None, None, None)
+    assert "Invalid variant sequence" in caplog.text
+
+
+def test_too_many_protein_changes_gives_no_protein_but_still_the_dna():
+    reference = "ATGGCTAAAGGTTAG"  # Met Ala Lys Gly Stop
+    sequence = "ATGGTTAAAGATTAG"  # two changes, Ala2Val and Gly4Asp, with an unchanged codon between them
+    everything = variant_plugin(reference=reference).transform({"seq": sequence})
+    assert everything["protein"] == "p.[Ala2Val;Gly4Asp]"
+    assert everything["class"] == "?"  # (a change in more than one place isn't classified)
+
+    # (changes in neighbouring codons are one change, so wouldn't be too many)
+    limited = variant_plugin(reference=reference, **{"protein.maxlen": 1}).transform({"seq": sequence})
+    assert limited["variant"] == "g.[5C>T;11G>A]"
+    assert (limited["protein"], limited["class"]) == (None, None)
+
+
+def test_sequence_and_reference_columns_can_be_dropped():
+    plugin = variant_plugin(reference="— ref", drop_columns=True)
+    result = plugin.transform({"seq": "ATGGTTAAATAG", "ref": REFERENCE, "other": 7})
+    assert result == {"other": 7, "variant": "g.5C>T", "protein": "p.Ala2Val", "class": "M"}
+    assert plugin.remove_fields(["seq", "ref", "other"]) == ["seq", "ref"]
+
+    keeping = variant_plugin(reference="— ref")
+    assert keeping.remove_fields(["seq", "ref", "other"]) == []
+    assert "seq" in keeping.transform({"seq": "ATGGTTAAATAG", "ref": REFERENCE})
+
+
+def test_a_fixed_reference_has_no_column_to_drop():
+    result = variant_plugin(drop_columns=True).transform({"seq": "ATGGTTAAATAG"})
+    assert "seq" not in result
+
+
+def test_in_a_query(ddbc, make_source):
+    source = make_source(
+        "select * from (values ('ATGGTTAAATAG', 1), ('ATGGCTAAATAG', 2), ('', 3), ('ATGGCTTAATAG', 4)) t(seq, n)"
+    )
+    plugin = variant_plugin()
+    plugin.prepare(ddbc, source)
+    output = plugin.execute(ddbc, source)
+    assert output.columns == ["seq", "n", "variant", "protein", "class"]
+    assert sorted(output.fetchall(), key=repr) == sorted(
+        [
+            ("ATGGTTAAATAG", 1, "g.5C>T", "p.Ala2Val", "M"),
+            ("ATGGCTAAATAG", 2, "g.=", "p.=", "W"),
+            (None, None, None, None, None),  # (nothing to call: a whole row of nulls, the number too)
+            ("ATGGCTTAATAG", 4, "g.7A>T", "p.Lys3Ter", "N"),
+        ],
+        key=repr,
+    )
+
+
+def test_in_a_query_with_columns_dropped(ddbc, make_source):
+    source = make_source("select * from (values ('ATGGTTAAATAG', 1)) t(seq, n)")
+    plugin = variant_plugin(drop_columns=True)
+    plugin.prepare(ddbc, source)
+    output = plugin.execute(ddbc, source)
+    assert output.columns == ["n", "variant", "protein", "class"]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason='the "Drop unmatched rows" option is never looked at: switching it on makes no difference to what comes out',
+)
+def test_unmatched_rows_can_be_dropped(ddbc, make_source):
+    source = make_source("select * from (values ('ATGGTTAAATAG'), ('ATGNCTAAATAG')) t(seq)")  # (one can't be matched)
+    outputs = []
+    for drop in (False, True):
+        plugin = variant_plugin(drop=drop)
+        plugin.prepare(ddbc, source)
+        outputs.append(sorted(plugin.execute(ddbc, source).fetchall(), key=repr))
+    assert outputs[0] != outputs[1]
+
+
+def test_the_cached_finder_agrees_with_the_real_one():
+    """(Nothing calls this yet: it's here in case it's put to use)"""
+    from countess_variant_caller import find_variant_string  # pylint: disable=import-outside-toplevel
+
+    plugin = variant_plugin()
+    for _ in range(2):  # (the second time it's from the cache)
+        assert plugin.find_variant_string_cached("g.", REFERENCE, "ATGGTTAAATAG") == find_variant_string(
+            "g.", REFERENCE, "ATGGTTAAATAG"
+        )
+
+
+# ---- the variant converter
+
+CONVERSIONS = [
+    ("wt", "p.="),
+    ("WT", "p.="),
+    ("A12G", "p.Ala12Gly"),
+    ("A12A", "p.Ala12="),  # (the same amino acid)
+    ("A12*", "p.Ala12Ter"),
+    ("A12-", "p.Ala12del"),
+    ("M1X", "p.Met1Ter"),
+    ("syn_12A>G", "c.12A>G"),
+    ("garbage", None),
+    (None, None),
+]
+
+
+def convert(ddbc, make_source, **params):
+    values = ", ".join("(NULL)" if v is None else f"('{v}')" for v, _ in CONVERSIONS)
+    source = make_source(f"select * from (values {values}) t(variant)")
+    plugin = VariantConverter()
+    plugin.prepare(ddbc, source)
+    for key, value in params.items():
+        plugin.set_parameter(key, value)
+    return plugin.execute(ddbc, source)
+
+
+def test_variant_converter(ddbc, make_source):
+    output = convert(ddbc, make_source)
+    assert output.columns == ["variant"]  # (the converted ones replace the originals)
+    assert sorted(output.fetchall(), key=repr) == sorted([(e,) for _, e in CONVERSIONS], key=repr)
+
+
+def test_each_variant_converts_to_the_right_thing(ddbc, make_source):
+    for variant, expected in CONVERSIONS:
+        source = make_source("select " + ("NULL::varchar" if variant is None else f"'{variant}'") + " as variant")
+        plugin = VariantConverter()
+        plugin.prepare(ddbc, source)
+        assert plugin.execute(ddbc, source).fetchall() == [(expected,)], variant
+
+
+def test_variant_converter_offset_and_prefixes(ddbc, make_source):
+    output = convert(ddbc, make_source, offset=100, prefix_aa="ENST1", prefix_nt="NM_1")
+    expected = {
+        "ENST1:p.=",
+        "ENST1:p.Ala112=",
+        "ENST1:p.Ala112Gly",
+        "ENST1:p.Ala112Ter",
+        "ENST1:p.Ala112del",
+        "ENST1:p.Met101Ter",
+        "NM_1:c.12A>G",  # (the offset is only for protein positions, not these)
+        None,
+    }
+    assert {r[0] for r in output.fetchall()} == expected
+
+
+def test_variant_converter_negative_offset(ddbc, make_source):
+    source = make_source("select 'A12G' as variant")
+    plugin = VariantConverter()
+    plugin.prepare(ddbc, source)
+    plugin.set_parameter("offset", -2)
+    assert plugin.execute(ddbc, source).fetchall() == [("p.Ala10Gly",)]
+
+
+def test_variant_converter_into_another_column(ddbc, make_source):
+    output = convert(ddbc, make_source, variant_out="hgvs")
+    assert output.columns == ["variant", "hgvs"]
+    rows = dict(output.fetchall())
+    assert rows["A12G"] == "p.Ala12Gly" and rows["garbage"] is None and rows["syn_12A>G"] == "c.12A>G"
+
+
+def test_variant_converter_keeps_the_other_columns(ddbc, make_source):
+    source = make_source("select * from (values ('x', 'A12G', 5)) t(name, variant, n)")
+    plugin = VariantConverter()
+    plugin.prepare(ddbc, source)
+    output = plugin.execute(ddbc, source)
+    assert output.columns == ["name", "n", "variant"]
+    assert output.fetchall() == [("x", 5, "p.Ala12Gly")]
+
+
+@pytest.mark.parametrize(
+    "params,expected_keys",
+    [
+        ({}, ["seq", "variant", "protein", "class"]),
+        ({"variant.output": ""}, ["seq", "protein", "class"]),  # (no DNA variant column)
+        ({"protein.output": ""}, ["seq", "variant", "class"]),  # (just the classification of the protein change)
+        ({"classify": ""}, ["seq", "variant", "protein"]),
+        ({"variant.output": "", "protein.output": "", "classify": ""}, ["seq"]),  # (nothing to call)
+    ],
+)
+def test_outputs_can_be_left_out(params, expected_keys):
+    result = variant_plugin(**params).transform({"seq": "ATGGTTAAATAG"})
+    assert list(result) == expected_keys
+
+
+def test_outputs_which_are_left_out_arent_added_to_a_query(ddbc, make_source):
+    source = make_source("select 'ATGGTTAAATAG' as seq")
+    plugin = variant_plugin(**{"variant.output": "", "classify": ""})
+    plugin.prepare(ddbc, source)
+    assert plugin.execute(ddbc, source).columns == ["seq", "protein"]
