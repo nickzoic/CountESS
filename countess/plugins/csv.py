@@ -25,7 +25,8 @@ from countess.core.parameters import (
     TabularMultiParam,
 )
 from countess.core.plugins import DuckdbLoadFileWithTheLotPlugin, DuckdbSaveFilePlugin
-from countess.utils.duckdb import duckdb_dtype_to_datatype_choice, duckdb_escape_identifier, duckdb_source_to_table
+from countess.utils.duckdb import duckdb_dtype_to_datatype_choice, duckdb_source_to_table
+from countess.utils.sql import Id, Raw, Sql, Type, join
 
 CSV_FILE_TYPES: Sequence[Tuple[str, Union[str, List[str]]]] = [
     ("CSV", [".csv", ".csv.gz", ".csv.bz2"]),
@@ -102,24 +103,23 @@ class LoadCsvPlugin(DuckdbLoadFileWithTheLotPlugin):
             # there's three cases here, either we've got both a column
             # name or a column parameter or both, depending on the relative
             # lengths of the column lists.
-            proj = ",".join(
-                duckdb_escape_identifier(cn)
-                if cp is None
-                else (
-                    (
-                        f"TRY_CAST(NULL as {csv_sql_type(cp.type.value)})"
-                        if cn is None
-                        else f"TRY_CAST({duckdb_escape_identifier(cn)} as {csv_sql_type(cp.type.value)})"
+            proj = join(
+                (
+                    Id(cn)
+                    if cp is None
+                    else Sql.template(
+                        "TRY_CAST({value} AS {type}) AS {name}",
+                        value=Raw("NULL") if cn is None else Id(cn),
+                        type=Type(csv_sql_type(cp.type.value)),
+                        name=Id(cp.name.value or f"column{num}"),
                     )
-                    + " AS "
-                    + (duckdb_escape_identifier(cp.name.value) if cp.name.value else "column%d" % num)
                 )
                 for num, (cn, cp) in enumerate(zip_longest(rel_columns, self.columns))
                 if cp is None or cp.type.is_not_none()
             )
 
             logger.debug("LoadCsvPlugin.load_file proj %s", proj)
-            rel = rel.project(proj)
+            rel = rel.project(str(proj))
 
         # `rel = cursor.read_csv(fh)` returns a `DuckDBPyRelation`
         # with `rel.alias` starting `DUCKDB_INTERNAL_OBJECTSTORE:`
@@ -227,11 +227,12 @@ class SaveCsvPlugin(DuckdbSaveFilePlugin):
             return
 
         if len(self.sorting):
-            order_by = ",".join(
-                duckdb_escape_identifier(sp.order_by.value) + (" desc" if sp.descending else "") for sp in self.sorting
+            order_by = join(
+                Sql.template("{column} DESC", column=Id(sp.order_by.value)) if sp.descending else Id(sp.order_by.value)
+                for sp in self.sorting
             )
             logger.debug("SaveCsvPlugin.execute order_by %s", order_by)
-            source = source.order(order_by)
+            source = source.order(str(order_by))
 
         filename = self.filename.get_file_path()
         Path(filename).parent.mkdir(parents=True, exist_ok=True)
