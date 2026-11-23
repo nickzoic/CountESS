@@ -102,8 +102,7 @@ def test_save_csv_bz2():
 
     with bz2.open("tests/output1.csv.bz2", "rt") as fh:
         text = fh.read()
-        # (bz2 isn't something DuckDB can write, so this is still done by pandas, which quotes every name in the header)
-        assert text == '"a","b","c"\n1,2.01,"three"\n4,5.5,"six"\n7,8.8,"nine"\n'
+        assert text == 'a,b,"c"\n1,2.01,"three"\n4,5.5,"six"\n7,8.8,"nine"\n'
 
 
 # ---- more of the CSV plugins
@@ -116,6 +115,7 @@ import lzma
 import pytest
 
 from countess.plugins.csv import CSV_DELIMITER_CHOICES, csv_sql_type, write_to_csv
+from countess.utils import compress
 
 
 @pytest.fixture(name="csv_ddbc")
@@ -183,7 +183,7 @@ def test_quoting_everything(csv_ddbc, tmp_path):
     assert path.read_text(encoding="utf-8") == '"n","s","f"\n"1","a b","2.5"\n"2","c,d","3.5"\n"3","say ""hi""",\n'
 
 
-# ---- quoting the non-numbers, which is done by DuckDB (except for .bz2 and .xz)
+# ---- quoting the non-numbers, which is done by DuckDB for every kind of file
 
 
 def test_only_the_columns_which_are_not_numbers_are_quoted(csv_ddbc, tmp_path):
@@ -234,49 +234,139 @@ def test_unusual_column_names_can_be_saved(csv_ddbc, tmp_path):
     assert rows == [["a,b", 'we"ird, name', "it's"], ["1", "x", "y"]]
 
 
-def test_a_gzipped_file_is_the_same_as_the_plain_one(csv_ddbc, tmp_path):
-    csv_ddbc.sql("create or replace table t as select range as n, 'text ' || range as s from range(20000)")
-    plain = save_csv(csv_ddbc, tmp_path / "plain.csv")
-    path = tmp_path / "zipped.csv.gz"
-    save_csv_to(csv_ddbc, path)
-    assert path.read_bytes()[:2] == b"\x1f\x8b"  # (it's really gzipped)
-    with gzip.open(path, "rt", encoding="utf-8") as fh:
-        assert fh.read() == plain
+EXTENSIONS = ["", ".gz", ".bz2", ".xz"]
+OPENERS = {"": open, ".gz": gzip.open, ".bz2": bz2.open, ".xz": lzma.open}
 
 
-def test_a_saved_file_loads_back_the_same(csv_ddbc, tmp_path):
-    path = tmp_path / "out.csv.gz"
-    csv_ddbc.sql(
-        "create or replace table t as select * from (values (1, 'a b', 2.5, DATE '2024-01-02'),"
-        " (2, 'c,d', 3.5, DATE '2024-01-03')) v(n, s, f, d)"
+def read_text(path):
+    """What's in a file, decompressed if it's compressed, as the text which was written to it"""
+    for extension, opener in OPENERS.items():
+        if extension and str(path).lower().endswith(extension):
+            with opener(path, "rt", encoding="utf-8", newline="") as fh:
+                return fh.read()
+    return path.read_text(encoding="utf-8")
+
+
+def many_rows(connection, rows=20000):
+    connection.sql(
+        f"create or replace table t as select range as n, 'text ' || range as s, range * 0.25 as f from range({rows})"
     )
+
+
+@pytest.fixture(name="small_blocks")
+def fixture_small_blocks(monkeypatch):
+    """So that even a small file is written as a lot of blocks, each of them a complete little file of its own"""
+    monkeypatch.setattr(compress, "DEFAULT_BLOCK_SIZE", 4096)
+
+
+@pytest.mark.parametrize("quoting", [True, False], ids=["quoting non-numbers", "minimal quoting"])
+@pytest.mark.parametrize("header", [True, False])
+def test_every_kind_of_file_has_exactly_the_same_text(csv_ddbc, tmp_path, quoting, header):
+    texts = {}
+    for extension in EXTENSIONS:
+        path = tmp_path / f"out.csv{extension}"
+        save_csv_to(csv_ddbc, path, quoting=quoting, header=header)
+        texts[extension] = read_text(path)
+    assert len(set(texts.values())) == 1, texts
+    assert texts[""].count("\n") == (4 if header else 3)
+
+
+@pytest.mark.parametrize("quoting", [True, False], ids=["quoting non-numbers", "minimal quoting"])
+def test_every_kind_of_file_has_the_same_text_when_it_is_written_in_a_lot_of_blocks(
+    csv_ddbc, tmp_path, small_blocks, quoting
+):
+    many_rows(csv_ddbc)
+    texts = {}
+    for extension in EXTENSIONS:
+        path = tmp_path / f"out.csv{extension}"
+        save_csv_to(csv_ddbc, path, quoting=quoting)
+        texts[extension] = read_text(path)
+    assert texts[""].count("\n") == 20001
+    assert all(text == texts[""] for text in texts.values())
+
+
+def test_quoting_everything_has_the_same_text_in_every_kind_of_file(csv_ddbc, tmp_path):
+    texts = set()
+    for extension in EXTENSIONS:
+        path = tmp_path / f"all.csv{extension}"
+        write_to_csv(csv_ddbc, csv_ddbc.table("t"), str(path), ",", csv_module.QUOTE_ALL)
+        texts.add(read_text(path))
+    assert texts == {'"n","s","f"\n"1","a b","2.5"\n"2","c,d","3.5"\n"3","say ""hi""",\n'}
+
+
+@pytest.mark.parametrize("extension", EXTENSIONS)
+def test_sorting_works_for_every_kind_of_file(csv_ddbc, tmp_path, small_blocks, extension):
+    many_rows(csv_ddbc, 3000)
+    path = tmp_path / f"sorted.csv{extension}"
+    save_csv_to(csv_ddbc, path, **{"sorting.0.order_by": "n", "sorting.0.descending": True})
+    lines = read_text(path).splitlines()
+    assert lines[:3] == ['n,"s",f', '2999,"text 2999",749.75', '2998,"text 2998",749.50']
+    assert lines[-1] == '0,"text 0",0.00'
+
+
+@pytest.mark.parametrize("extension", EXTENSIONS)
+def test_a_saved_file_loads_back_the_same(csv_ddbc, tmp_path, small_blocks, extension):
+    many_rows(csv_ddbc)
+    path = tmp_path / f"out.csv{extension}"
     save_csv_to(csv_ddbc, path)
-    assert csv_ddbc.sql(f"select * from read_csv('{path}')").fetchall() == csv_ddbc.table("t").fetchall()
+    _, output = load_csv(csv_ddbc, path)
+    assert output.fetchall() == csv_ddbc.table("t").fetchall()
 
 
-def test_it_isnt_done_by_pandas(csv_ddbc, tmp_path, monkeypatch):
+@pytest.mark.parametrize("extension", [".gz", ".bz2", ".xz"])
+def test_a_compressed_file_is_what_the_other_tools_can_read(csv_ddbc, tmp_path, small_blocks, extension):
+    """(It's a lot of complete little files one after another, which is as good as one for them)"""
+    many_rows(csv_ddbc, 5000)
+    path = tmp_path / f"out.csv{extension}"
+    save_csv_to(csv_ddbc, path)
+    assert len(pd.read_csv(path)) == 5000
+    if extension == ".gz":
+        assert csv_ddbc.sql(f"select count(*), sum(n) from read_csv('{path}')").fetchone() == (5000, 12497500)
+
+
+@pytest.mark.parametrize("extension", [".gz", ".bz2", ".xz"])
+def test_a_file_with_no_rows_is_still_a_whole_compressed_file(csv_ddbc, tmp_path, extension):
+    csv_ddbc.sql("create or replace table t as select * from (values (1, 'a')) v(n, s) where false")
+    path = tmp_path / f"empty.csv{extension}"
+    save_csv_to(csv_ddbc, path)
+    assert read_text(path) == 'n,"s"\n'
+    save_csv_to(csv_ddbc, path, header=False)
+    assert read_text(path) == ""
+
+
+def test_the_extension_can_be_in_any_case(csv_ddbc, tmp_path):
+    path = tmp_path / "OUT.CSV.GZ"
+    save_csv_to(csv_ddbc, path)
+    assert path.read_bytes()[:2] == b"\x1f\x8b"
+
+
+@pytest.mark.parametrize("extension", EXTENSIONS)
+def test_it_isnt_done_by_pandas(csv_ddbc, tmp_path, monkeypatch, extension):
     def not_pandas(*args, **kwargs):
         raise AssertionError("pandas was used to write the file")
 
     monkeypatch.setattr(pd.DataFrame, "to_csv", not_pandas)
-    for name in ("out.csv", "out.csv.gz"):
-        save_csv_to(csv_ddbc, tmp_path / name)
-        assert (tmp_path / name).exists()
+    for quoting in (True, False):
+        path = tmp_path / f"out{quoting}.csv{extension}"
+        save_csv_to(csv_ddbc, path, quoting=quoting)
+        assert path.exists()
 
 
-def test_a_save_which_fails_leaves_nothing_where_there_was_nothing(csv_ddbc, tmp_path):
-    path = tmp_path / "out.csv.gz"
+@pytest.mark.parametrize("extension", EXTENSIONS)
+def test_a_save_which_fails_leaves_nothing_where_there_was_nothing(csv_ddbc, tmp_path, extension):
+    path = tmp_path / f"out.csv{extension}"
     with pytest.raises(duckdb.Error):
         save_csv_to(csv_ddbc, path, source=failing_source(csv_ddbc))
     assert list(tmp_path.iterdir()) == []  # (not the file and not a temporary file)
 
 
-def test_a_save_which_fails_leaves_the_old_file_as_it_was(csv_ddbc, tmp_path):
-    path = tmp_path / "out.csv"
-    path.write_text("the old file\n", encoding="utf-8")
+@pytest.mark.parametrize("extension", EXTENSIONS)
+def test_a_save_which_fails_leaves_the_old_file_as_it_was(csv_ddbc, tmp_path, extension):
+    path = tmp_path / f"out.csv{extension}"
+    path.write_bytes(b"the old file\n")
     with pytest.raises(duckdb.Error):
         save_csv_to(csv_ddbc, path, source=failing_source(csv_ddbc))
-    assert path.read_text(encoding="utf-8") == "the old file\n"
+    assert path.read_bytes() == b"the old file\n"
     assert list(tmp_path.iterdir()) == [path]
 
 
@@ -289,9 +379,17 @@ def failing_source(connection):
     return connection.table("failing")
 
 
+@pytest.mark.parametrize("extension", EXTENSIONS)
+def test_the_ways_of_quoting_duckdb_cant_do_are_written_by_pandas_to_every_kind_of_file(csv_ddbc, tmp_path, extension):
+    csv_ddbc.sql("create or replace table t as select * from (values (1, 'a'), (2, 'b')) v(n, s)")
+    path = tmp_path / f"out.csv{extension}"
+    write_to_csv(csv_ddbc, csv_ddbc.table("t"), str(path), ",", csv_module.QUOTE_NONE)
+    assert read_text(path) == "n,s\n1,a\n2,b\n"
+
+
 def test_save_xz(csv_ddbc, tmp_path):
     path = tmp_path / "out.csv.xz"
-    save_csv_text = '"n","s","f"\n1,"a b",2.5\n2,"c,d",3.5\n3,"say ""hi""",""\n'
+    save_csv_text = 'n,"s",f\n1,"a b",2.5\n2,"c,d",3.5\n3,"say ""hi""",\n'
     plugin = SaveCsvPlugin()
     plugin.set_parameter("filename", str(path))
     source = csv_ddbc.table("t")

@@ -3,10 +3,10 @@ import csv
 import gzip
 import logging
 import lzma
-from io import BufferedWriter, BytesIO, TextIOBase
+from io import BufferedWriter, BytesIO
 from itertools import zip_longest
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple, TypedDict, Union
+from typing import IO, Callable, Iterable, List, Optional, Sequence, Tuple, TypedDict, Union
 
 import duckdb
 from duckdb import DuckDBPyConnection, DuckDBPyRelation
@@ -25,6 +25,7 @@ from countess.core.parameters import (
     TabularMultiParam,
 )
 from countess.core.plugins import DuckdbLoadFileWithTheLotPlugin, DuckdbSaveFilePlugin
+from countess.utils.compress import compressed_output
 from countess.utils.duckdb import (
     duckdb_dtype_is_boolean,
     duckdb_dtype_is_numeric,
@@ -33,7 +34,6 @@ from countess.utils.duckdb import (
     duckdb_escape_literal,
     duckdb_source_to_table,
 )
-from countess.utils.files import atomic_output
 
 CSV_FILE_TYPES: Sequence[Tuple[str, Union[str, List[str]]]] = [
     ("CSV", [".csv", ".csv.gz", ".csv.bz2"]),
@@ -168,36 +168,57 @@ class SaveCsvOrderParameter(TabularMultiParam):
     descending = BooleanParam("Descending")
 
 
-def copy_to_csv_quoting_non_numerics(
-    ddbc: DuckDBPyConnection, source: DuckDBPyRelation, filename: str, sep: str, header: bool = True
+# the ways of quoting which DuckDB can do, either itself or by being told which columns to quote
+_COPY_QUOTING = (csv.QUOTE_MINIMAL, csv.QUOTE_ALL, csv.QUOTE_NONNUMERIC)
+
+# for the ways of quoting it can't do the file is written by pandas, compressed by whichever of these goes with the name
+_PANDAS_OPENERS: dict[str, Callable[..., IO]] = {".gz": gzip.open, ".bz2": bz2.open, ".xz": lzma.open}
+
+
+def copy_to_csv(
+    ddbc: DuckDBPyConnection, source: DuckDBPyRelation, filename: str, sep: str, quoting: int, header: bool = True
 ) -> None:
-    """Write `source` to `filename` with DuckDB, quoting every column which isn't a number (or a boolean), the
-    same as `csv.QUOTE_NONNUMERIC` does.  DuckDB doesn't have a quoting mode for that, but it can be told
-    which columns to always quote, and it's a lot quicker than going via pandas: it formats and compresses
-    in C++, instead of making a DataFrame of every chunk to be formatted a row at a time in Python.
+    """Write `source` to `filename` with DuckDB, compressed (as .gz, .bz2 or .xz) if that's what the name says.
 
-    What it writes isn't quite what pandas did:
-    * DuckDB quotes the names in the header row for the same columns as the values, not all of them.
-    * a missing value is empty, whatever the column.  With pandas a missing number was an empty string in
-      quotes, so couldn't be told from an empty string; now an empty string is `""` and a missing string isn't.
-    * NaN and infinity are `nan` and `inf`, where pandas wrote nothing for NaN, and booleans are `true` and `false`.
+    DuckDB has no quoting mode for csv.QUOTE_NONNUMERIC, but it can be told which columns to always quote, so that
+    quotes every column which isn't a number (or a boolean).  Going via DuckDB is a lot quicker than going via pandas,
+    which made a DataFrame of every chunk and formatted it a row at a time in Python: DuckDB formats it in C++.
 
-    The file is only there once it's all been written."""
+    The compression is done as the file is written (see `countess.utils.compress`) rather than by DuckDB, which
+    only does gzip and does it in one thread, or by Python's gzip, bz2 or lzma, which would be one thread too.
+    Whichever it's compressed with the uncompressed text is exactly the same, and the file isn't there until it's
+    all been written.
 
-    quoted = [
-        duckdb_escape_identifier(name)
-        for name, dtype in zip(source.columns, source.dtypes)
-        if not (duckdb_dtype_is_numeric(dtype) or duckdb_dtype_is_boolean(dtype))
+    What's written isn't quite what pandas used to write:
+    * with QUOTE_NONNUMERIC DuckDB quotes the names in the header row for the same columns as the values, not
+      all of them.
+    * a missing value is empty, whatever the column.  With pandas a missing number was an empty string in quotes,
+      so couldn't be told from an empty string; now an empty string is `""` and a missing string isn't.
+    * a FLOAT (32 bit) is written as the shortest text which reads back as the same number (23512.799), where pandas
+      widened it to a double first (23512.798828125).
+    * NaN and infinity are `nan` and `inf`, where pandas wrote nothing for NaN, and booleans are `true` and `false`."""
+
+    options = [
+        "FORMAT CSV",
+        f"HEADER {'true' if header else 'false'}",
+        f"DELIMITER {duckdb_escape_literal(sep)}",
+        "COMPRESSION none",  # (otherwise it would compress it as well, going by the name)
+        "USE_TMP_FILE false",  # (it's written to a temporary file already, so it is all there or isn't)
     ]
-    options = ["FORMAT CSV", f"HEADER {'true' if header else 'false'}", f"DELIMITER {duckdb_escape_literal(sep)}"]
-    if quoted:
-        options.append(f"FORCE_QUOTE ({', '.join(quoted)})")
-    if filename.endswith(".gz"):
-        options.append("COMPRESSION gzip")
+    if quoting == csv.QUOTE_ALL:
+        options.append("FORCE_QUOTE *")
+    elif quoting == csv.QUOTE_NONNUMERIC:
+        quoted = [
+            duckdb_escape_identifier(name)
+            for name, dtype in zip(source.columns, source.dtypes)
+            if not (duckdb_dtype_is_numeric(dtype) or duckdb_dtype_is_boolean(dtype))
+        ]
+        if quoted:
+            options.append(f"FORCE_QUOTE ({', '.join(quoted)})")
 
-    with atomic_output(filename) as temp_filename:
-        query = f"COPY ({source.sql_query()}) TO {duckdb_escape_literal(temp_filename)} ({', '.join(options)})"
-        logger.debug("copy_to_csv_quoting_non_numerics %s", query)
+    with compressed_output(ddbc, filename) as target:
+        query = f"COPY ({source.sql_query()}) TO {duckdb_escape_literal(target)} ({', '.join(options)})"
+        logger.debug("copy_to_csv %s", query)
         ddbc.execute(query)
 
 
@@ -206,7 +227,12 @@ def write_to_csv(
 ) -> None:
     logger.debug("writing file %s", filename)
 
-    def _write(fh: TextIOBase | gzip.GzipFile | bz2.BZ2File | lzma.LZMAFile, **kwargs):
+    if quoting in _COPY_QUOTING:
+        copy_to_csv(ddbc, source, filename, sep, quoting, header)
+        return
+
+    # DuckDB can't do any of the others (QUOTE_NONE and so on), so write it via pandas
+    def _write(fh: IO, **kwargs):
         # the type check supression is because the first parameter to
         # to_csv is:
         #     path_or_buf: str | PathLike[str] | WriteBuffer[bytes] | WriteBuffer[str]
@@ -217,32 +243,13 @@ def write_to_csv(
             chunk = source.fetch_df_chunk()
             chunk.to_csv(fh, header=False, index=False, **kwargs)  # type: ignore
 
-    # If it's one of the formats that duckdb doesn't (yet) support, write via pandas
-    # See also https://github.com/nickzoic/duckdb-compression/
-
-    if filename.endswith(".bz2"):
-        with bz2.open(filename, "w") as fh_bz2:
-            _write(fh_bz2, sep=sep, quoting=quoting)
-    elif filename.endswith(".xz"):
-        with lzma.open(filename, "w") as fh_xz:
-            _write(fh_xz, sep=sep, quoting=quoting)
-    elif quoting == csv.QUOTE_NONNUMERIC:
-        # duckdb has no quoting mode for this, but it can be told which columns to quote
-        # https://github.com/duckdb/duckdb-python/discussions/491
-        copy_to_csv_quoting_non_numerics(ddbc, source, filename, sep, header)
-    elif quoting not in (csv.QUOTE_MINIMAL, csv.QUOTE_ALL):
-        # duckdb doesn't support any of the others
-        if filename.endswith(".gz"):
-            with gzip.open(filename, "w") as fh_gz:
-                _write(fh_gz, sep=sep, quoting=quoting)
-        else:
-            with open(filename, "w", encoding="utf-8") as fh_open:
-                _write(fh_open, sep=sep, quoting=quoting)
-    elif quoting == csv.QUOTE_ALL:
-        # otherwise write it directly
-        source.to_csv(filename, sep=sep, quoting=quoting, header=header)
-    else:
-        source.to_csv(filename, sep=sep, header=header)
+    for extension, opener in _PANDAS_OPENERS.items():
+        if filename.lower().endswith(extension):
+            with opener(filename, "w") as fh_compressed:
+                _write(fh_compressed, sep=sep, quoting=quoting)
+            return
+    with open(filename, "w", encoding="utf-8") as fh_open:
+        _write(fh_open, sep=sep, quoting=quoting)
 
 
 class SaveCsvPlugin(DuckdbSaveFilePlugin):
