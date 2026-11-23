@@ -50,11 +50,19 @@ dev = [
     'pytest-socket~=0.7.0',
     'requests-mock~=1.12.1',
     'scipy~=1.18.1',
+    'indexed_bzip2~=2.0',
+    'lzma-mt~=0.2',
 ]
 
 gui = [
     "tkinterweb~=3.23.5",
     "ttkthemes~=3.3.0",
+]
+
+# Not needed, but make reading .bz2 and .xz files faster: the standard library's modules are used without them.
+fast = [
+    'indexed_bzip2~=2.0',
+    'lzma-mt~=0.2',
 ]
 
 [project.entry-points.countess_plugins]

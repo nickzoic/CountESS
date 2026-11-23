@@ -2,7 +2,6 @@ import bz2
 import csv
 import gzip
 import logging
-import lzma
 from io import BufferedWriter, BytesIO
 from itertools import zip_longest
 from pathlib import Path
@@ -25,7 +24,7 @@ from countess.core.parameters import (
     TabularMultiParam,
 )
 from countess.core.plugins import DuckdbLoadFileWithTheLotPlugin, DuckdbSaveFilePlugin
-from countess.utils.compress import compressed_output
+from countess.utils.compress import compressed_output, open_for_reading
 from countess.utils.duckdb import (
     duckdb_dtype_is_boolean,
     duckdb_dtype_is_numeric,
@@ -92,11 +91,8 @@ class LoadCsvPlugin(DuckdbLoadFileWithTheLotPlugin):
             "skiprows": 1 if self.header and len(self.columns) > 0 else 0,
             "header": self.header.value and len(self.columns) == 0,
         }
-        if filename.endswith(".bz2"):
-            with bz2.open(filename) as fh:
-                rel = cursor.read_csv(fh, **options)  # typing: disable=arg-type
-        elif filename.endswith(".xz"):
-            with lzma.open(filename) as fh:
+        if filename.lower().endswith((".bz2", ".xz")):
+            with open_for_reading(filename) as fh:
                 rel = cursor.read_csv(fh, **options)  # typing: disable=arg-type
         else:
             rel = cursor.read_csv(filename, **options)  # typing: disable=arg-type

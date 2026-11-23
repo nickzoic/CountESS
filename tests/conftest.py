@@ -49,3 +49,18 @@ def collect_garbage_on_the_main_thread(monkeypatch):
     yield
     if made_a_window:
         gc.collect()
+
+
+@pytest.fixture(params=["fast decoders", "standard library"])
+def each_decoder(request, monkeypatch):
+    """Runs a test with the fast .bz2 and .xz decoders (skipped if neither is installed), and again with only
+    the standard library's bz2 and lzma, which is what's used if they aren't installed."""
+    from countess.utils import compress  # pylint: disable=import-outside-toplevel
+
+    if request.param == "fast decoders":
+        if compress.indexed_bzip2 is None and compress.lzma_mt is None:
+            pytest.skip("indexed_bzip2 and lzma-mt are not installed")
+    else:
+        monkeypatch.setattr(compress, "indexed_bzip2", None)
+        monkeypatch.setattr(compress, "lzma_mt", None)
+    return request.param

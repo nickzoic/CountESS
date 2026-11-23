@@ -25,6 +25,15 @@ CountESS can be [installed from pypi](https://pypi.org/project/countess/):
 
     pip install countess[gui]@git+https://github.com/CountESS-Project/CountESS.git
 
+To read `.bz2` and `.xz` files faster, particularly `.fastq.bz2`, also install the `fast` extra:
+
+    pip install countess[gui,fast]
+
+This installs [indexed_bzip2](https://pypi.org/project/indexed-bzip2/), which decodes `.bz2` files several times
+faster than Python's own module on a single core and can use several cores, and
+[lzma-mt](https://pypi.org/project/lzma-mt/), which can use several cores for `.xz` files made with more than one
+block (as `xz -T0` makes them).  CountESS reads exactly the same data with or without them.
+
 ### ... using git, for development
 
 Clone the repository and [install for development](https://pip.pypa.io/en/stable/cli/pip_install/#cmdoption-e):

@@ -2,9 +2,11 @@ import bz2
 import gzip
 import lzma
 
+import duckdb
 import pytest
 
 from countess.plugins.fastq import LoadFastaPlugin, LoadFastqPlugin
+from countess.utils import compress
 
 # name, sequence, qualities:  'I' is a quality of 40, '#' is 2, '5' is 20, '+' is 10
 READS = [
@@ -141,7 +143,7 @@ def test_no_files_gives_nothing(ddbc):
         (".fastq.xz", lambda p, m: lzma.open(p, m)),
     ],
 )
-def test_compressed_files(ddbc, tmp_path, assert_rows, extension, opener):
+def test_compressed_files(ddbc, tmp_path, assert_rows, extension, opener, each_decoder):
     path = tmp_path / f"reads{extension}"
     with opener(path, "wt") if extension != ".fastq" and extension != ".fq" else open(path, "w", encoding="utf-8") as f:
         f.write(fastq_text())
@@ -186,6 +188,52 @@ def test_fasta_limit_and_filenames(ddbc, tmp_path, monkeypatch, assert_rows):
     assert_rows(output, [(*row, "seqs.fa") for row in FASTA_ROWS])
 
 
+def many_reads_text(n=30000):
+    sequences = ["ACGTAC", "TTGACC", "GGGGGG", "ACACAC", "CATCAT", "TGCATG", "AAAAAA"]
+    return "".join(f"@r{i}\n{sequences[i * i % 7]}\n+\nIIIIII\n" for i in range(n))
+
+
+def compress_in_many_blocks(extension, text):
+    """.bz2 and .xz files which have a lot of blocks in them, so there's something for the fast decoders to do"""
+    if extension == ".fastq.bz2":
+        return bz2.compress(text.encode(), 1)
+    if compress.lzma_mt is not None:
+        return compress.lzma_mt.compress(text.encode(), preset=0, threads=4)
+    return lzma.compress(text.encode(), preset=0)  # pragma: no cover
+
+
+@pytest.mark.parametrize("extension", [".fastq.bz2", ".fastq.xz"])
+@pytest.mark.filterwarnings("ignore:Compression")
+def test_a_file_with_a_lot_of_blocks_loads_the_same_as_a_plain_one(ddbc, tmp_path, each_decoder, extension):
+    text = many_reads_text()
+    plain = tmp_path / "reads.fastq"
+    plain.write_text(text, encoding="utf-8")
+    compressed = tmp_path / f"reads{extension}"
+    compressed.write_bytes(compress_in_many_blocks(extension, text))
+    expected = sorted(load(ddbc, plain).fetchall())
+    assert sum(count for _, count in expected) == 30000
+    assert sorted(load(ddbc, compressed).fetchall()) == expected
+
+
+@pytest.mark.parametrize("extension", [".fastq.bz2", ".fastq.xz"])
+@pytest.mark.filterwarnings("ignore:Compression")
+def test_a_file_which_is_not_all_there_is_an_error_not_fewer_reads(ddbc, tmp_path, each_decoder, extension):
+    data = compress_in_many_blocks(extension, many_reads_text())
+    path = tmp_path / f"reads{extension}"
+    path.write_bytes(data[: len(data) * 6 // 10])
+    with pytest.raises(duckdb.Error):
+        load(ddbc, path).fetchall()
+
+
+@pytest.mark.parametrize("extension", [".fastq.bz2", ".fastq.xz"])
+@pytest.mark.filterwarnings("ignore:Compression")
+def test_an_empty_file_is_an_error_not_no_reads(ddbc, tmp_path, each_decoder, extension):
+    path = tmp_path / f"reads{extension}"
+    path.write_bytes(b"")
+    with pytest.raises((duckdb.Error, EOFError)):
+        load(ddbc, path).fetchall()
+
+
 @pytest.mark.parametrize(
     "extension,opener",
     [
@@ -194,7 +242,7 @@ def test_fasta_limit_and_filenames(ddbc, tmp_path, monkeypatch, assert_rows):
         (".fasta.xz", lambda p, m: lzma.open(p, m)),
     ],
 )
-def test_compressed_fasta(ddbc, tmp_path, assert_rows, extension, opener):
+def test_compressed_fasta(ddbc, tmp_path, assert_rows, extension, opener, each_decoder):
     path = tmp_path / f"seqs{extension}"
     with opener(path, "wt") as f:
         f.write(FASTA)

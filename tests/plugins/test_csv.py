@@ -26,7 +26,7 @@ def test_load_csv_gz():
     assert len(output) == 4
 
 
-def test_load_csv_bz2():
+def test_load_csv_bz2(each_decoder):
     plugin = LoadCsvPlugin()
     plugin.set_parameter("files.0.filename", "tests/input1.csv.bz2")
     output = plugin.execute(ddbc, None)
@@ -488,7 +488,7 @@ def test_save_xz(csv_ddbc, tmp_path):
         assert fh.read() == save_csv_text
 
 
-def test_load_xz(csv_ddbc, tmp_path):
+def test_load_xz(csv_ddbc, tmp_path, each_decoder):
     path = tmp_path / "in.csv.xz"
     with lzma.open(path, "wt", encoding="utf-8") as fh:
         fh.write("n,s\n1,x\n2,y\n")
@@ -741,7 +741,7 @@ def test_a_number_with_a_fraction_is_rounded_to_an_integer_not_refused(csv_ddbc,
     assert [row[0] for row in output.fetchall()] == [1, 2, 2, -2]
 
 
-def test_integers_from_a_compressed_file_are_64_bit(csv_ddbc, tmp_path):
+def test_integers_from_a_compressed_file_are_64_bit(csv_ddbc, tmp_path, each_decoder):
     path = tmp_path / "ints.csv.bz2"
     with bz2.open(path, "wt", encoding="utf-8") as fh:
         fh.write("n\n3000000000\n-3000000000\n")

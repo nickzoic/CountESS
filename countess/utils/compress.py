@@ -13,10 +13,14 @@ Python, pandas and DuckDB read them that way, so what's decompressed is exactly 
 block size.  The compression is a little less good than for one stream, as each block starts again.
 
 Memory used is a few blocks per thread however big the file is.  zlib, bz2 and lzma all let go of the GIL while
-they're compressing, so the threads do run at the same time."""
+they're compressing, so the threads do run at the same time.
+
+For reading, `open_for_reading` gives a file to read the uncompressed bytes from, using faster decoders for .bz2 and
+.xz files if they're installed (see the "fast" extra)."""
 
 import bz2
 import contextlib
+import gzip
 import io
 import logging
 import lzma
@@ -26,12 +30,24 @@ import secrets
 import threading
 import zlib
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Iterator, Optional, Union
+from typing import IO, Callable, Iterator, Optional, Union, cast
 
 import fsspec  # type: ignore[import-untyped]
 from duckdb import DuckDBPyConnection
 
 from countess.utils.files import atomic_output
+
+# Decoders which can use several cores, and which for bzip2 is a good deal faster even on one.  Neither is needed:
+# without them the standard library's bz2 and lzma are used.
+try:
+    import indexed_bzip2  # type: ignore[import-not-found,import-untyped]
+except ImportError:  # pragma: no cover
+    indexed_bzip2 = None  # type: ignore[assignment]
+
+try:
+    import lzma_mt  # type: ignore[import-not-found,import-untyped]
+except ImportError:  # pragma: no cover
+    lzma_mt = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +93,42 @@ def default_workers() -> int:
     except (AttributeError, OSError):  # pragma: no cover  (not on every platform)
         cores = os.cpu_count() or 1
     return max(1, min(cores, MAX_WORKERS))
+
+
+def open_for_reading(filename: Union[str, "os.PathLike[str]"], workers: Optional[int] = None) -> IO[bytes]:
+    """Open a file to read its bytes, decompressed if its name ends in .gz, .bz2 or .xz.
+
+    A .bz2 file is read with indexed_bzip2 if that's installed, which is about 6 times faster than the standard
+    library's bz2 on one core and uses `workers` cores (by default as many as `default_workers` says) for the many
+    independent blocks in a bzip2 file.  A .xz file is read with lzma_mt if that's installed, which is a little
+    faster on one core and can use `workers` cores if the file was made with several blocks (as `xz -T` does),
+    which it isn't if it was made with just `xz`.  If they're not installed it's the standard library's modules,
+    which use one core.  Whichever is used it reads the same bytes, and a damaged file is an error and not a short
+    file.  (The other kinds of file are just opened, and not for text.)"""
+
+    name = str(filename).lower()
+    workers = workers or default_workers()
+
+    if name.endswith(".bz2"):
+        if indexed_bzip2 is None:
+            return bz2.open(filename, "rb")
+        # (bz2 says an empty file is incomplete, but indexed_bzip2 reads it as nothing, as it would an empty stream)
+        if os.path.getsize(filename) == 0:
+            raise EOFError("Compressed file ended before the end-of-stream marker was reached")
+        logger.debug("reading %s with indexed_bzip2, %d workers", filename, workers)
+        return indexed_bzip2.open(str(filename), parallelization=workers)
+
+    if name.endswith(".xz"):
+        if lzma_mt is None:
+            return lzma.open(filename, "rb")
+        logger.debug("reading %s with lzma_mt, %d workers", filename, workers)
+        return cast(IO[bytes], lzma_mt.open(filename, "rb", threads=workers))  # (mode "rb" is bytes)
+
+    if name.endswith(".gz"):
+        return cast(IO[bytes], gzip.open(filename, "rb"))  # (it is one, but typeshed doesn't say so)
+
+    # (it's for the caller to close, not for a `with` here)
+    return open(filename, "rb")  # pylint: disable=consider-using-with
 
 
 class BlockCompressedFile(io.RawIOBase):
