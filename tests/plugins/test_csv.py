@@ -177,12 +177,6 @@ def test_quoting_can_be_minimal(csv_ddbc, tmp_path):
     )
 
 
-def test_quoting_everything(csv_ddbc, tmp_path):
-    path = tmp_path / "all.csv"
-    write_to_csv(csv_ddbc, csv_ddbc.table("t"), str(path), ",", csv_module.QUOTE_ALL)
-    assert path.read_text(encoding="utf-8") == '"n","s","f"\n"1","a b","2.5"\n"2","c,d","3.5"\n"3","say ""hi""",\n'
-
-
 # ---- quoting the non-numbers, which is done by DuckDB for every kind of file
 
 
@@ -285,15 +279,6 @@ def test_every_kind_of_file_has_the_same_text_when_it_is_written_in_a_lot_of_blo
     assert all(text == texts[""] for text in texts.values())
 
 
-def test_quoting_everything_has_the_same_text_in_every_kind_of_file(csv_ddbc, tmp_path):
-    texts = set()
-    for extension in EXTENSIONS:
-        path = tmp_path / f"all.csv{extension}"
-        write_to_csv(csv_ddbc, csv_ddbc.table("t"), str(path), ",", csv_module.QUOTE_ALL)
-        texts.add(read_text(path))
-    assert texts == {'"n","s","f"\n"1","a b","2.5"\n"2","c,d","3.5"\n"3","say ""hi""",\n'}
-
-
 @pytest.mark.parametrize("extension", EXTENSIONS)
 def test_sorting_works_for_every_kind_of_file(csv_ddbc, tmp_path, small_blocks, extension):
     many_rows(csv_ddbc, 3000)
@@ -379,12 +364,12 @@ def failing_source(connection):
     return connection.table("failing")
 
 
-@pytest.mark.parametrize("extension", EXTENSIONS)
-def test_the_ways_of_quoting_duckdb_cant_do_are_written_by_pandas_to_every_kind_of_file(csv_ddbc, tmp_path, extension):
-    csv_ddbc.sql("create or replace table t as select * from (values (1, 'a'), (2, 'b')) v(n, s)")
-    path = tmp_path / f"out.csv{extension}"
-    write_to_csv(csv_ddbc, csv_ddbc.table("t"), str(path), ",", csv_module.QUOTE_NONE)
-    assert read_text(path) == "n,s\n1,a\n2,b\n"
+@pytest.mark.parametrize("quoting", [csv_module.QUOTE_ALL, csv_module.QUOTE_NONE, csv_module.QUOTE_NOTNULL, 99])
+def test_only_minimal_and_non_numeric_quoting_can_be_written(csv_ddbc, tmp_path, quoting):
+    path = tmp_path / "out.csv"
+    with pytest.raises(ValueError, match="QUOTE_MINIMAL or csv.QUOTE_NONNUMERIC"):
+        write_to_csv(csv_ddbc, csv_ddbc.table("t"), str(path), ",", quoting)
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_save_xz(csv_ddbc, tmp_path):
@@ -571,14 +556,6 @@ def test_header_row_either_way_and_with_either_kind_of_quoting(csv_ddbc, tmp_pat
     assert len(lines) == (3 if header else 2)
     assert (lines[0] in ('n,"s"', "n,s")) == header
     assert lines[-1] in ('2,"b"', "2,b")
-
-
-def test_header_row_left_out_when_quoting_everything(csv_ddbc, tmp_path):
-    csv_ddbc.sql("create or replace table t as select * from (values (1, 'a'), (2, 'b')) v(n, s)")
-    for header, expected_lines in ((True, 3), (False, 2)):
-        path = tmp_path / f"all{header}.csv"
-        write_to_csv(csv_ddbc, csv_ddbc.table("t"), str(path), ",", csv_module.QUOTE_ALL, header=header)
-        assert len(path.read_text(encoding="utf-8").splitlines()) == expected_lines
 
 
 @pytest.mark.parametrize("header", [True, False])
