@@ -201,10 +201,10 @@ def test_filenames_relative_to_config(tmp_path):
     assert all(os.path.exists(p) for p in paths)
 
 
-EXPECTED_OUTPUT = """"thing","result"
-"foo",23512.798828125
+EXPECTED_OUTPUT = """"thing",result
+"foo",23512.799
 "baz",12769.0
-"qux",14728.1142578125
+"qux",14728.114
 """
 
 

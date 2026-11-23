@@ -2,8 +2,7 @@ import bz2
 import csv
 import gzip
 import logging
-import lzma
-from io import BufferedWriter, BytesIO, TextIOBase
+from io import BufferedWriter, BytesIO
 from itertools import zip_longest
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple, TypedDict, Union
@@ -25,7 +24,15 @@ from countess.core.parameters import (
     TabularMultiParam,
 )
 from countess.core.plugins import DuckdbLoadFileWithTheLotPlugin, DuckdbSaveFilePlugin
-from countess.utils.duckdb import duckdb_dtype_to_datatype_choice, duckdb_escape_identifier, duckdb_source_to_table
+from countess.utils.compress import compressed_output, open_for_reading
+from countess.utils.duckdb import (
+    duckdb_dtype_is_boolean,
+    duckdb_dtype_is_numeric,
+    duckdb_dtype_to_datatype_choice,
+    duckdb_escape_identifier,
+    duckdb_escape_literal,
+    duckdb_source_to_table,
+)
 
 CSV_FILE_TYPES: Sequence[Tuple[str, Union[str, List[str]]]] = [
     ("CSV", [".csv", ".csv.gz", ".csv.bz2"]),
@@ -84,11 +91,8 @@ class LoadCsvPlugin(DuckdbLoadFileWithTheLotPlugin):
             "skiprows": 1 if self.header and len(self.columns) > 0 else 0,
             "header": self.header.value and len(self.columns) == 0,
         }
-        if filename.endswith(".bz2"):
-            with bz2.open(filename) as fh:
-                rel = cursor.read_csv(fh, **options)  # typing: disable=arg-type
-        elif filename.endswith(".xz"):
-            with lzma.open(filename) as fh:
+        if filename.lower().endswith((".bz2", ".xz")):
+            with open_for_reading(filename) as fh:
                 rel = cursor.read_csv(fh, **options)  # typing: disable=arg-type
         else:
             rel = cursor.read_csv(filename, **options)  # typing: disable=arg-type
@@ -160,43 +164,50 @@ class SaveCsvOrderParameter(TabularMultiParam):
     descending = BooleanParam("Descending")
 
 
-def write_to_csv(source: DuckDBPyRelation, filename: str, sep: str, quoting: int, header: bool = True) -> None:
+def write_to_csv(
+    ddbc: DuckDBPyConnection, source: DuckDBPyRelation, filename: str, sep: str, quoting: int, header: bool = True
+) -> None:
+    """Write `source` to `filename` with DuckDB, compressed (as .gz, .bz2 or .xz) if that's what the name says.
+
+    `quoting` is csv.QUOTE_MINIMAL, which is what DuckDB does, or csv.QUOTE_NONNUMERIC.  DuckDB has no mode for
+    that, but it can be told which columns to always quote, so that quotes every column which isn't a number
+    (or a boolean).
+
+    The compression is done as the file is written (see `countess.utils.compress`) rather than by DuckDB, which
+    only does gzip and does it in one thread.  Whichever it's compressed with the uncompressed text is exactly the
+    same, and the file isn't there until it's all been written.
+
+    Some things about what's written:
+    * with QUOTE_NONNUMERIC the names in the header row are quoted for the same columns as the values are.
+    * a missing value is empty, whatever the column, and an empty string is `""`.
+    * a FLOAT (32 bit) is written as the shortest text which reads back as the same number.
+    * NaN and infinity are `nan` and `inf`, and booleans are `true` and `false`."""
+
+    if quoting not in (csv.QUOTE_MINIMAL, csv.QUOTE_NONNUMERIC):
+        raise ValueError(f"quoting must be csv.QUOTE_MINIMAL or csv.QUOTE_NONNUMERIC, not {quoting!r}")
+
     logger.debug("writing file %s", filename)
 
-    def _write(fh: TextIOBase | gzip.GzipFile | bz2.BZ2File | lzma.LZMAFile, **kwargs):
-        # the type check supression is because the first parameter to
-        # to_csv is:
-        #     path_or_buf: str | PathLike[str] | WriteBuffer[bytes] | WriteBuffer[str]
-        # but bz2.BZFile|lzma.LZMAFile don't seem to be compatible.
-        chunk = source.fetch_df_chunk()
-        chunk.to_csv(fh, header=header, index=False, **kwargs)  # type: ignore
-        while len(chunk) > 0:
-            chunk = source.fetch_df_chunk()
-            chunk.to_csv(fh, header=False, index=False, **kwargs)  # type: ignore
+    options = [
+        "FORMAT CSV",
+        f"HEADER {'true' if header else 'false'}",
+        f"DELIMITER {duckdb_escape_literal(sep)}",
+        "COMPRESSION none",  # (otherwise it would compress it as well, going by the name)
+        "USE_TMP_FILE false",  # (it's written to a temporary file already, so it is all there or isn't)
+    ]
+    if quoting == csv.QUOTE_NONNUMERIC:
+        quoted = [
+            duckdb_escape_identifier(name)
+            for name, dtype in zip(source.columns, source.dtypes)
+            if not (duckdb_dtype_is_numeric(dtype) or duckdb_dtype_is_boolean(dtype))
+        ]
+        if quoted:
+            options.append(f"FORCE_QUOTE ({', '.join(quoted)})")
 
-    # If it's one of the formats that duckdb doesn't (yet) support, write via pandas
-    # See also https://github.com/nickzoic/duckdb-compression/
-
-    if filename.endswith(".bz2"):
-        with bz2.open(filename, "w") as fh_bz2:
-            _write(fh_bz2, sep=sep, quoting=quoting)
-    elif filename.endswith(".xz"):
-        with lzma.open(filename, "w") as fh_xz:
-            _write(fh_xz, sep=sep, quoting=quoting)
-    elif quoting not in (csv.QUOTE_MINIMAL, csv.QUOTE_ALL):
-        # duckdb doesn't support this properly
-        # https://github.com/duckdb/duckdb-python/discussions/491
-        if filename.endswith(".gz"):
-            with gzip.open(filename, "w", compresslevel=6) as fh_gz:
-                _write(fh_gz, sep=sep, quoting=quoting)
-        else:
-            with open(filename, "w", encoding="utf-8") as fh_open:
-                _write(fh_open, sep=sep, quoting=quoting)
-    elif quoting == csv.QUOTE_ALL:
-        # otherwise write it directly
-        source.to_csv(filename, sep=sep, quoting=quoting, header=header)
-    else:
-        source.to_csv(filename, sep=sep, header=header)
+    with compressed_output(ddbc, filename) as target:
+        query = f"COPY ({source.sql_query()}) TO {duckdb_escape_literal(target)} ({', '.join(options)})"
+        logger.debug("write_to_csv %s", query)
+        ddbc.execute(query)
 
 
 class SaveCsvPlugin(DuckdbSaveFilePlugin):
@@ -236,6 +247,7 @@ class SaveCsvPlugin(DuckdbSaveFilePlugin):
         filename = self.filename.get_file_path()
         Path(filename).parent.mkdir(parents=True, exist_ok=True)
         write_to_csv(
+            ddbc,
             source,
             filename,
             sep=self.SEPARATORS[self.delimiter.value],

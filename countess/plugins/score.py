@@ -1,6 +1,6 @@
 import logging
 import secrets
-from math import log, sqrt
+from math import log, nan, sqrt
 from typing import Optional
 
 from duckdb import DuckDBPyConnection, DuckDBPyRelation
@@ -19,39 +19,39 @@ from countess.utils.duckdb import (
 logger = logging.getLogger(__name__)
 
 
-def _wls_statsmodels(xs: list[float], ys: list[float], ws: list[float]) -> tuple[float, float]:
-    """Slope and standard error of the slope, via statsmodels.  Only used as a fallback for degenerate
-    inputs (see `_wls_slope`) because it's about 15x slower than `_wls_slope`."""
-
-    import statsmodels.api as statsmodels_api  # pylint: disable=import-outside-toplevel
-
-    fit = statsmodels_api.WLS(ys, [[x, 1.0] for x in xs], ws).fit()
-    return fit.params[0], fit.bse[0]
-
-
 def _wls_slope(xs: list[float], ys: list[float], ws: list[float]) -> tuple[float, float]:
     """Slope and standard error of the slope of the weighted least squares line y = slope * x + intercept.
 
-    This is the closed form of what `statsmodels.WLS(ys, [[x, 1] ...], ws).fit()` does for a straight line
-    (two parameters): centre x and y on their weighted means, then
+    This is the closed form of weighted least squares for a straight line (two parameters): centre x and y on
+    their weighted means, then
 
         slope = sum(w (x - xbar) (y - ybar)) / sum(w (x - xbar)^2)
         var(slope) = (sum(w residual^2) / (n - 2)) / sum(w (x - xbar)^2)
 
     Working from the centred values rather than the raw sums of w, wx, wxx, ... avoids catastrophic
     cancellation when the x values are large compared to their spread.  Building and decomposing a
-    statsmodels model for every variant was the single largest cost of scoring a typical experiment.
+    general purpose regression model for every variant was the single largest cost of scoring a typical
+    experiment.
+
+    There's no line to be had from fewer than two points, from points with no weight, or from points which
+    all have the same x, so those give NaN for both.  The standard error also needs a degree of freedom to
+    spare (n - 2 > 0), so two points give a slope but a NaN standard error.
     """
 
+    if len(xs) < 2:
+        return nan, nan
     sw = sum(ws)
+    if not sw > 0.0:
+        return nan, nan
     xbar = sum(w * x for w, x in zip(ws, xs)) / sw
     ybar = sum(w * y for w, y in zip(ws, ys)) / sw
     sxx = sum(w * (x - xbar) ** 2 for w, x in zip(ws, xs))
     if not sxx > 0.0:
-        # all the x values are the same: there's no unique slope.  Let statsmodels decide what to do.
-        return _wls_statsmodels(xs, ys, ws)
+        return nan, nan
     sxy = sum(w * (x - xbar) * (y - ybar) for w, x, y in zip(ws, xs, ys))
     slope = sxy / sxx
+    if len(xs) < 3:
+        return slope, nan
     intercept = ybar - slope * xbar
     rss = sum(w * (y - slope * x - intercept) ** 2 for w, x, y in zip(ws, xs, ys))
     return slope, sqrt(rss / (len(xs) - 2) / sxx)

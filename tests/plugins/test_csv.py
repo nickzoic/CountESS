@@ -26,7 +26,7 @@ def test_load_csv_gz():
     assert len(output) == 4
 
 
-def test_load_csv_bz2():
+def test_load_csv_bz2(each_decoder):
     plugin = LoadCsvPlugin()
     plugin.set_parameter("files.0.filename", "tests/input1.csv.bz2")
     output = plugin.execute(ddbc, None)
@@ -75,7 +75,7 @@ def test_save_csv():
 
     with open("tests/output1.csv", "r", encoding="utf-8") as fh:
         text = fh.read()
-        assert text == '"a","b","c"\n1,2.01,"three"\n4,5.5,"six"\n7,8.8,"nine"\n'
+        assert text == 'a,b,"c"\n1,2.01,"three"\n4,5.5,"six"\n7,8.8,"nine"\n'
 
 
 def test_save_csv_gz():
@@ -88,7 +88,7 @@ def test_save_csv_gz():
 
     with gzip.open("tests/output1.csv.gz", "rt") as fh:
         text = fh.read()
-        assert text == '"a","b","c"\n1,2.01,"three"\n4,5.5,"six"\n7,8.8,"nine"\n'
+        assert text == 'a,b,"c"\n1,2.01,"three"\n4,5.5,"six"\n7,8.8,"nine"\n'
 
 
 def test_save_csv_bz2():
@@ -102,18 +102,21 @@ def test_save_csv_bz2():
 
     with bz2.open("tests/output1.csv.bz2", "rt") as fh:
         text = fh.read()
-        assert text == '"a","b","c"\n1,2.01,"three"\n4,5.5,"six"\n7,8.8,"nine"\n'
+        assert text == 'a,b,"c"\n1,2.01,"three"\n4,5.5,"six"\n7,8.8,"nine"\n'
 
 
 # ---- more of the CSV plugins
 
 
 import csv as csv_module
+import io
 import lzma
 
 import pytest
 
 from countess.plugins.csv import CSV_DELIMITER_CHOICES, csv_sql_type, write_to_csv
+from countess.utils import compress
+from countess.utils.duckdb import duckdb_escape_identifier, duckdb_escape_literal
 
 
 @pytest.fixture(name="csv_ddbc")
@@ -138,6 +141,17 @@ def save_csv(connection, path, **params):
     return path.read_text(encoding="utf-8")
 
 
+def save_csv_to(connection, path, source=None, **params):
+    """Saves table t (or `source`) to `path`, where it isn't wanted back as text"""
+    source = connection.table("t") if source is None else source
+    plugin = SaveCsvPlugin()
+    plugin.set_parameter("filename", str(path))
+    for key, value in params.items():
+        plugin.set_parameter(key, value)
+    plugin.prepare(connection, source)
+    assert plugin.execute(connection, source) is None
+
+
 def load_csv(connection, *filenames, **params):
     plugin = LoadCsvPlugin()
     for number, filename in enumerate(filenames):
@@ -151,28 +165,320 @@ def load_csv(connection, *filenames, **params):
 def test_save_delimiters(csv_ddbc, tmp_path, delimiter, sep):
     text = save_csv(csv_ddbc, tmp_path / "out.csv", delimiter=delimiter)
     lines = text.splitlines()
-    assert lines[0] == sep.join(['"n"', '"s"', '"f"'])
+    assert lines[0] == sep.join(["n", '"s"', "f"])
     assert lines[1] == sep.join(["1", '"a b"', "2.5"])
 
 
 def test_quoting_can_be_minimal(csv_ddbc, tmp_path):
     text = save_csv(csv_ddbc, tmp_path / "out.csv", quoting=False)
     assert text == 'n,s,f\n1,a b,2.5\n2,"c,d",3.5\n3,"say ""hi""",\n'
-    # (quoting the non-numbers is done by pandas, which also quotes a missing value: with minimal quoting it's blank)
+    # (quoting the non-numbers always quotes the text, and the names of the columns it's in)
     assert save_csv(csv_ddbc, tmp_path / "out2.csv", quoting=True) == (
-        '"n","s","f"\n1,"a b",2.5\n2,"c,d",3.5\n3,"say ""hi""",""\n'
+        'n,"s",f\n1,"a b",2.5\n2,"c,d",3.5\n3,"say ""hi""",\n'
     )
 
 
-def test_quoting_everything(csv_ddbc, tmp_path):
-    path = tmp_path / "all.csv"
-    write_to_csv(csv_ddbc.table("t"), str(path), ",", csv_module.QUOTE_ALL)
-    assert path.read_text(encoding="utf-8") == '"n","s","f"\n"1","a b","2.5"\n"2","c,d","3.5"\n"3","say ""hi""",\n'
+# ---- quoting the non-numbers, which is done by DuckDB for every kind of file
+
+
+def test_only_the_columns_which_are_not_numbers_are_quoted(csv_ddbc, tmp_path):
+    csv_ddbc.sql(
+        "create or replace table t as select 1 as i, 2.5 as d, true as b, 'x' as s, DATE '2024-01-02' as dt,"
+        " TIMESTAMP '2024-01-02 03:04:05' as ts, 7::DECIMAL(5,2) as dc, 8::HUGEINT as h"
+    )
+    lines = save_csv(csv_ddbc, tmp_path / "out.csv").splitlines()
+    assert lines == ['i,d,b,"s","dt","ts",dc,h', '1,2.5,true,"x","2024-01-02","2024-01-02 03:04:05",7.00,8']
+
+
+def test_there_may_be_nothing_to_quote(csv_ddbc, tmp_path):
+    csv_ddbc.sql("create or replace table t as select 1 as a, 2.5 as b")
+    assert save_csv(csv_ddbc, tmp_path / "out.csv") == "a,b\n1,2.5\n"
+
+
+EXTENSIONS = ["", ".gz", ".bz2", ".xz"]
+OPENERS = {"": open, ".gz": gzip.open, ".bz2": bz2.open, ".xz": lzma.open}
+
+
+def read_text(path):
+    """What's in a file, decompressed if it's compressed, as the text which was written to it"""
+    for extension, opener in OPENERS.items():
+        if extension and str(path).lower().endswith(extension):
+            with opener(path, "rt", encoding="utf-8", newline="") as fh:
+                return fh.read()
+    return path.read_text(encoding="utf-8")
+
+
+def many_rows(connection, rows=20000):
+    connection.sql(
+        f"create or replace table t as select range as n, 'text ' || range as s, range * 0.25 as f from range({rows})"
+    )
+
+
+@pytest.fixture(name="small_blocks")
+def fixture_small_blocks(monkeypatch):
+    """So that even a small file is written as a lot of blocks, each of them a complete little file of its own"""
+    monkeypatch.setattr(compress, "DEFAULT_BLOCK_SIZE", 4096)
+
+
+# ---- the separators, with both kinds of quoting
+
+DELIMITERS = list(SaveCsvPlugin.SEPARATORS.items())  # (what the plugin is called, what's between the fields)
+EVERY_DELIMITER = pytest.mark.parametrize(
+    "delimiter,sep", DELIMITERS, ids=["comma", "semicolon", "pipe", "space", "tab"]
+)
+BOTH_KINDS_OF_QUOTING = pytest.mark.parametrize(
+    "quoting", [True, False], ids=["quoting non-numbers", "minimal quoting"]
+)
+
+# text which has each of the separators in it, quotes, a newline, nothing at all, and a missing value
+AWKWARD = [
+    "plain",
+    "has,comma",
+    "has;semi",
+    "has|pipe",
+    "has\ttab",
+    "has space",
+    'say "hi"',
+    "",
+    " padded ",
+    "all , ; | \t of them",
+    "caf\u00e9 \u2603",
+    "two\nlines",
+    None,
+]
+# (for what has to be loaded again: not a newline, which can't be loaded; not nothing, which is the same as missing;
+# and not a quote, which comes back doubled as it does from any file, see
+# test_text_with_quotes_in_it_is_not_the_same_after_being_saved_and_loaded)
+LOADABLE = [text for text in AWKWARD if text and "\n" not in text and '"' not in text]
+
+
+def texts_table(connection, texts):
+    """Make table t with a row for each of `texts` (which is a number, the text and half the number)"""
+    values = ", ".join(f"({n}, {duckdb_escape_literal(text)}, {n * 0.5})" for n, text in enumerate(texts))
+    connection.sql(f"create or replace table t as select * from (values {values}) v(n, s, f)")
+
+
+def expected_field(text, sep, quoting):
+    """How a bit of text is written: quoted if everything that isn't a number is quoted, or if it has to be, because
+    it has what's between the fields in it or a quote or a newline, or because it's empty (so as not to be taken
+    for a missing value, which is nothing).  Quotes in it are doubled."""
+    if quoting or sep in text or '"' in text or "\n" in text or text == "":
+        return '"' + text.replace('"', '""') + '"'
+    return text
+
+
+@BOTH_KINDS_OF_QUOTING
+@EVERY_DELIMITER
+def test_what_is_written_for_each_separator_and_kind_of_quoting(csv_ddbc, tmp_path, quoting, delimiter, sep):
+    texts = [text for text in AWKWARD if text is not None and "\n" not in text]
+    texts_table(csv_ddbc, texts)
+    lines = save_csv(csv_ddbc, tmp_path / "out.csv", quoting=quoting, delimiter=delimiter).splitlines()
+    assert lines == [
+        sep.join(["n", '"s"' if quoting else "s", "f"]),
+        *(sep.join([str(n), expected_field(text, sep, quoting), str(n * 0.5)]) for n, text in enumerate(texts)),
+    ]
+
+
+@BOTH_KINDS_OF_QUOTING
+@EVERY_DELIMITER
+def test_a_missing_value_is_blank_but_an_empty_string_is_quoted(csv_ddbc, tmp_path, quoting, delimiter, sep):
+    csv_ddbc.sql("create or replace table t as select * from (values (1, ''), (2, NULL), (3, 'x')) v(n, s)")
+    lines = save_csv(csv_ddbc, tmp_path / "out.csv", quoting=quoting, delimiter=delimiter).splitlines()
+    assert lines[1:] == [f'1{sep}""', f"2{sep}", f"3{sep}" + ('"x"' if quoting else "x")]
+
+
+@BOTH_KINDS_OF_QUOTING
+@EVERY_DELIMITER
+def test_awkward_text_comes_back_as_it_went(csv_ddbc, tmp_path, quoting, delimiter, sep):
+    texts_table(csv_ddbc, AWKWARD)
+    text = save_csv(csv_ddbc, tmp_path / "out.csv", quoting=quoting, delimiter=delimiter)
+    rows = list(csv_module.reader(io.StringIO(text, newline=""), delimiter=sep))
+    assert rows[0] == ["n", "s", "f"]
+    assert all(len(row) == 3 for row in rows)
+    assert [int(row[0]) for row in rows[1:]] == list(range(len(AWKWARD)))
+    assert [row[1] for row in rows[1:]] == [text or "" for text in AWKWARD]  # (missing and empty are both empty)
+    assert [float(row[2]) for row in rows[1:]] == [n * 0.5 for n in range(len(AWKWARD))]
+
+
+@BOTH_KINDS_OF_QUOTING
+@EVERY_DELIMITER
+def test_no_header_row_for_any_separator(csv_ddbc, tmp_path, quoting, delimiter, sep):
+    texts_table(csv_ddbc, ["a b", "c,d"])
+    lines = save_csv(csv_ddbc, tmp_path / "out.csv", quoting=quoting, delimiter=delimiter, header=False).splitlines()
+    assert lines == [
+        sep.join(["0", expected_field("a b", sep, quoting), "0.0"]),
+        sep.join(["1", expected_field("c,d", sep, quoting), "0.5"]),
+    ]
+
+
+@BOTH_KINDS_OF_QUOTING
+@EVERY_DELIMITER
+def test_column_names_with_separators_in_them_come_back_as_they_went(csv_ddbc, tmp_path, quoting, delimiter, sep):
+    names = ["a,b", "c;d", "e|f", "g h", "i\tj", 'k"l']
+    columns = ", ".join(f"{n} as {duckdb_escape_identifier(name)}" for n, name in enumerate(names))
+    csv_ddbc.sql(f"create or replace table t as select {columns}, 'x' as text")
+    text = save_csv(csv_ddbc, tmp_path / "out.csv", quoting=quoting, delimiter=delimiter)
+    rows = list(csv_module.reader(io.StringIO(text, newline=""), delimiter=sep))
+    assert rows == [[*names, "text"], [*(str(n) for n in range(len(names))), "x"]]
+
+
+@BOTH_KINDS_OF_QUOTING
+@EVERY_DELIMITER
+def test_every_kind_of_file_has_the_same_text_for_each_separator(
+    csv_ddbc, tmp_path, monkeypatch, quoting, delimiter, sep
+):
+    # (blocks so small that most of them end in the middle of a row, and some in the middle of a quoted field)
+    monkeypatch.setattr(compress, "DEFAULT_BLOCK_SIZE", 331)
+    texts_table(csv_ddbc, AWKWARD * 25)
+    texts = {}
+    for extension in EXTENSIONS:
+        path = tmp_path / f"out.csv{extension}"
+        save_csv_to(csv_ddbc, path, quoting=quoting, delimiter=delimiter)
+        texts[extension] = read_text(path)
+    assert texts[""].count(sep) >= 2 * len(AWKWARD) * 25
+    assert all(text == texts[""] for text in texts.values())
+
+
+@BOTH_KINDS_OF_QUOTING
+@EVERY_DELIMITER
+@pytest.mark.parametrize("extension", EXTENSIONS)
+def test_a_saved_file_loads_back_the_same_for_each_separator(csv_ddbc, tmp_path, quoting, delimiter, sep, extension):
+    texts_table(csv_ddbc, LOADABLE)
+    path = tmp_path / f"out.csv{extension}"
+    save_csv_to(csv_ddbc, path, quoting=quoting, delimiter=delimiter)
+    _, output = load_csv(csv_ddbc, path, delimiter=delimiter)
+    assert output.fetchall() == [(n, text, n * 0.5) for n, text in enumerate(LOADABLE)]
+
+
+def test_unusual_column_names_can_be_saved(csv_ddbc, tmp_path):
+    csv_ddbc.sql('create or replace table t as select 1 as "a,b", \'x\' as "we""ird, name", \'y\' as "it\'s"')
+    text = save_csv(csv_ddbc, tmp_path / "out.csv")
+    rows = list(csv_module.reader(io.StringIO(text, newline="")))
+    assert rows == [["a,b", 'we"ird, name', "it's"], ["1", "x", "y"]]
+
+
+@pytest.mark.parametrize("quoting", [True, False], ids=["quoting non-numbers", "minimal quoting"])
+@pytest.mark.parametrize("header", [True, False])
+def test_every_kind_of_file_has_exactly_the_same_text(csv_ddbc, tmp_path, quoting, header):
+    texts = {}
+    for extension in EXTENSIONS:
+        path = tmp_path / f"out.csv{extension}"
+        save_csv_to(csv_ddbc, path, quoting=quoting, header=header)
+        texts[extension] = read_text(path)
+    assert len(set(texts.values())) == 1, texts
+    assert texts[""].count("\n") == (4 if header else 3)
+
+
+@pytest.mark.parametrize("quoting", [True, False], ids=["quoting non-numbers", "minimal quoting"])
+def test_every_kind_of_file_has_the_same_text_when_it_is_written_in_a_lot_of_blocks(
+    csv_ddbc, tmp_path, small_blocks, quoting
+):
+    many_rows(csv_ddbc)
+    texts = {}
+    for extension in EXTENSIONS:
+        path = tmp_path / f"out.csv{extension}"
+        save_csv_to(csv_ddbc, path, quoting=quoting)
+        texts[extension] = read_text(path)
+    assert texts[""].count("\n") == 20001
+    assert all(text == texts[""] for text in texts.values())
+
+
+@pytest.mark.parametrize("extension", EXTENSIONS)
+def test_sorting_works_for_every_kind_of_file(csv_ddbc, tmp_path, small_blocks, extension):
+    many_rows(csv_ddbc, 3000)
+    path = tmp_path / f"sorted.csv{extension}"
+    save_csv_to(csv_ddbc, path, **{"sorting.0.order_by": "n", "sorting.0.descending": True})
+    lines = read_text(path).splitlines()
+    assert lines[:3] == ['n,"s",f', '2999,"text 2999",749.75', '2998,"text 2998",749.50']
+    assert lines[-1] == '0,"text 0",0.00'
+
+
+@pytest.mark.parametrize("extension", EXTENSIONS)
+def test_a_saved_file_loads_back_the_same(csv_ddbc, tmp_path, small_blocks, extension):
+    many_rows(csv_ddbc)
+    path = tmp_path / f"out.csv{extension}"
+    save_csv_to(csv_ddbc, path)
+    _, output = load_csv(csv_ddbc, path)
+    assert output.fetchall() == csv_ddbc.table("t").fetchall()
+
+
+@pytest.mark.parametrize("extension", [".gz", ".bz2", ".xz"])
+def test_a_compressed_file_is_what_the_other_tools_can_read(csv_ddbc, tmp_path, small_blocks, extension):
+    """(It's a lot of complete little files one after another, which is as good as one for them)"""
+    many_rows(csv_ddbc, 5000)
+    path = tmp_path / f"out.csv{extension}"
+    save_csv_to(csv_ddbc, path)
+    assert len(pd.read_csv(path)) == 5000
+    if extension == ".gz":
+        assert csv_ddbc.sql(f"select count(*), sum(n) from read_csv('{path}')").fetchone() == (5000, 12497500)
+
+
+@pytest.mark.parametrize("extension", [".gz", ".bz2", ".xz"])
+def test_a_file_with_no_rows_is_still_a_whole_compressed_file(csv_ddbc, tmp_path, extension):
+    csv_ddbc.sql("create or replace table t as select * from (values (1, 'a')) v(n, s) where false")
+    path = tmp_path / f"empty.csv{extension}"
+    save_csv_to(csv_ddbc, path)
+    assert read_text(path) == 'n,"s"\n'
+    save_csv_to(csv_ddbc, path, header=False)
+    assert read_text(path) == ""
+
+
+def test_the_extension_can_be_in_any_case(csv_ddbc, tmp_path):
+    path = tmp_path / "OUT.CSV.GZ"
+    save_csv_to(csv_ddbc, path)
+    assert path.read_bytes()[:2] == b"\x1f\x8b"
+
+
+@pytest.mark.parametrize("extension", EXTENSIONS)
+def test_it_isnt_done_by_pandas(csv_ddbc, tmp_path, monkeypatch, extension):
+    def not_pandas(*args, **kwargs):
+        raise AssertionError("pandas was used to write the file")
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", not_pandas)
+    for quoting in (True, False):
+        path = tmp_path / f"out{quoting}.csv{extension}"
+        save_csv_to(csv_ddbc, path, quoting=quoting)
+        assert path.exists()
+
+
+@pytest.mark.parametrize("extension", EXTENSIONS)
+def test_a_save_which_fails_leaves_nothing_where_there_was_nothing(csv_ddbc, tmp_path, extension):
+    path = tmp_path / f"out.csv{extension}"
+    with pytest.raises(duckdb.Error):
+        save_csv_to(csv_ddbc, path, source=failing_source(csv_ddbc))
+    assert list(tmp_path.iterdir()) == []  # (not the file and not a temporary file)
+
+
+@pytest.mark.parametrize("extension", EXTENSIONS)
+def test_a_save_which_fails_leaves_the_old_file_as_it_was(csv_ddbc, tmp_path, extension):
+    path = tmp_path / f"out.csv{extension}"
+    path.write_bytes(b"the old file\n")
+    with pytest.raises(duckdb.Error):
+        save_csv_to(csv_ddbc, path, source=failing_source(csv_ddbc))
+    assert path.read_bytes() == b"the old file\n"
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def failing_source(connection):
+    def explode(n: int) -> int:
+        raise RuntimeError("boom")
+
+    connection.create_function("explode", explode)
+    connection.sql("create or replace view failing as select explode(n) as n from t")
+    return connection.table("failing")
+
+
+@pytest.mark.parametrize("quoting", [csv_module.QUOTE_ALL, csv_module.QUOTE_NONE, csv_module.QUOTE_NOTNULL, 99])
+def test_only_minimal_and_non_numeric_quoting_can_be_written(csv_ddbc, tmp_path, quoting):
+    path = tmp_path / "out.csv"
+    with pytest.raises(ValueError, match="QUOTE_MINIMAL or csv.QUOTE_NONNUMERIC"):
+        write_to_csv(csv_ddbc, csv_ddbc.table("t"), str(path), ",", quoting)
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_save_xz(csv_ddbc, tmp_path):
     path = tmp_path / "out.csv.xz"
-    save_csv_text = '"n","s","f"\n1,"a b",2.5\n2,"c,d",3.5\n3,"say ""hi""",""\n'
+    save_csv_text = 'n,"s",f\n1,"a b",2.5\n2,"c,d",3.5\n3,"say ""hi""",\n'
     plugin = SaveCsvPlugin()
     plugin.set_parameter("filename", str(path))
     source = csv_ddbc.table("t")
@@ -182,7 +488,7 @@ def test_save_xz(csv_ddbc, tmp_path):
         assert fh.read() == save_csv_text
 
 
-def test_load_xz(csv_ddbc, tmp_path):
+def test_load_xz(csv_ddbc, tmp_path, each_decoder):
     path = tmp_path / "in.csv.xz"
     with lzma.open(path, "wt", encoding="utf-8") as fh:
         fh.write("n,s\n1,x\n2,y\n")
@@ -348,20 +654,12 @@ def test_combining_nothing_gives_nothing(csv_ddbc):
 @pytest.mark.parametrize("quoting", [True, False], ids=["quoting non-numbers", "minimal quoting"])
 @pytest.mark.parametrize("header", [True, False])
 def test_header_row_either_way_and_with_either_kind_of_quoting(csv_ddbc, tmp_path, quoting, header):
-    # (quoting the non-numbers is done by pandas, and minimal quoting by DuckDB: both have to do what they're told)
+    # (both kinds of quoting are done by DuckDB: both have to do what they're told)
     csv_ddbc.sql("create or replace table t as select * from (values (1, 'a'), (2, 'b')) v(n, s)")
     lines = save_csv(csv_ddbc, tmp_path / "out.csv", quoting=quoting, header=header).splitlines()
     assert len(lines) == (3 if header else 2)
-    assert (lines[0] in ('"n","s"', "n,s")) == header
+    assert (lines[0] in ('n,"s"', "n,s")) == header
     assert lines[-1] in ('2,"b"', "2,b")
-
-
-def test_header_row_left_out_when_quoting_everything(csv_ddbc, tmp_path):
-    csv_ddbc.sql("create or replace table t as select * from (values (1, 'a'), (2, 'b')) v(n, s)")
-    for header, expected_lines in ((True, 3), (False, 2)):
-        path = tmp_path / f"all{header}.csv"
-        write_to_csv(csv_ddbc.table("t"), str(path), ",", csv_module.QUOTE_ALL, header=header)
-        assert len(path.read_text(encoding="utf-8").splitlines()) == expected_lines
 
 
 @pytest.mark.parametrize("header", [True, False])
@@ -385,7 +683,7 @@ def test_the_header_is_written_once_however_many_chunks_there_are(csv_ddbc, tmp_
         text = save_csv(csv_ddbc, tmp_path / f"big{header}.csv", header=header)
         lines = text.splitlines()
         assert len(lines) == 20000 + (1 if header else 0)
-        assert sum(1 for line in lines if line.startswith('"n"')) == (1 if header else 0)
+        assert sum(1 for line in lines if line.startswith("n,")) == (1 if header else 0)
 
 
 def test_every_delimiter_which_is_offered_can_be_saved():
@@ -443,7 +741,7 @@ def test_a_number_with_a_fraction_is_rounded_to_an_integer_not_refused(csv_ddbc,
     assert [row[0] for row in output.fetchall()] == [1, 2, 2, -2]
 
 
-def test_integers_from_a_compressed_file_are_64_bit(csv_ddbc, tmp_path):
+def test_integers_from_a_compressed_file_are_64_bit(csv_ddbc, tmp_path, each_decoder):
     path = tmp_path / "ints.csv.bz2"
     with bz2.open(path, "wt", encoding="utf-8") as fh:
         fh.write("n\n3000000000\n-3000000000\n")

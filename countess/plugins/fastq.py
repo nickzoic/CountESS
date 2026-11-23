@@ -1,6 +1,4 @@
-import bz2
 import logging
-import lzma
 from typing import Iterable, Optional
 
 import duckdb
@@ -9,6 +7,7 @@ import oxbow
 from countess import VERSION
 from countess.core.parameters import BaseParam, BooleanParam, FloatParam
 from countess.core.plugins import DuckdbLoadFileWithTheLotPlugin
+from countess.utils.compress import open_for_reading
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +40,8 @@ class LoadFastqPlugin(DuckdbLoadFileWithTheLotPlugin):
         if self.header_column:
             fields.append("name")
 
-        if filename.endswith(".xz"):
-            reader = oxbow.from_fastq(lambda: lzma.open(filename), None, fields=fields)
-        elif filename.endswith(".bz2"):
-            reader = oxbow.from_fastq(lambda: bz2.open(filename), None, fields=fields)
+        if filename.lower().endswith((".bz2", ".xz")):
+            reader = oxbow.from_fastq(lambda: open_for_reading(filename), None, fields=fields)
         else:
             reader = oxbow.from_fastq(filename, fields=fields)
 
@@ -94,10 +91,8 @@ class LoadFastaPlugin(DuckdbLoadFileWithTheLotPlugin):
     def load_file(
         self, cursor: duckdb.DuckDBPyConnection, filename: str, file_param: BaseParam, row_limit: Optional[int] = None
     ) -> duckdb.DuckDBPyRelation:
-        if filename.endswith(".xz"):
-            reader = oxbow.from_fasta(lambda: lzma.open(filename))
-        elif filename.endswith(".bz2"):
-            reader = oxbow.from_fasta(lambda: bz2.open(filename))
+        if filename.lower().endswith((".bz2", ".xz")):
+            reader = oxbow.from_fasta(lambda: open_for_reading(filename))
         else:
             reader = oxbow.from_fasta(filename)
 
