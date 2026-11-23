@@ -84,6 +84,9 @@ class PipelineNode:
         self.config: list[tuple[str, str, str]] = []
         self.table_name: str = "n_%x" % id(self)
         self.message: Optional[str] = None
+        # For a plugin which has no output rows to show a table of, text to show in its place (see
+        # DuckdbPlugin.preview_text_multi).  It's set along with the status, so it's always what that run made.
+        self.preview_text: Optional[str] = None
         self.finished = threading.Event()
 
         # `generation` is bumped every time something that affects this node's
@@ -154,6 +157,12 @@ class PipelineNode:
                 logger.debug("PipelineNode.run got result %d rows", rows)
                 if rows:
                     return self._settle(generation, PipelineNodeStatus.RESULT, "")
+            if result is None:
+                # no rows, but there may be something which can be shown instead, as for a plugin which saves a file
+                preview_text = self.plugin.preview_text_multi(ddbc, sources)
+                if preview_text is not None:
+                    logger.debug("PipelineNode.run got a text preview of %d characters", len(preview_text))
+                    return self._settle(generation, PipelineNodeStatus.RESULT, "", preview_text)
             logger.debug("PipelineNode.run got no result")
             return self._settle(generation, PipelineNodeStatus.ERROR, "")
         except (duckdb.InterruptException, duckdb.TransactionException):
@@ -165,7 +174,13 @@ class PipelineNode:
             logger.warning("PipelineNode.run %s exception %s", self.uuid, repr(exc))
             return self._settle(generation, PipelineNodeStatus.ERROR, "\n".join(traceback.format_exception(exc)))
 
-    def _settle(self, generation: int, status: Optional[PipelineNodeStatus], message: Optional[str] = None) -> bool:
+    def _settle(
+        self,
+        generation: int,
+        status: Optional[PipelineNodeStatus],
+        message: Optional[str] = None,
+        preview_text: Optional[str] = None,
+    ) -> bool:
         """Record the outcome of a run, unless the node changed while it was running.
         `status` of None means "retry".  Returns True if the node is DIRTY."""
         with self._lock:
@@ -175,9 +190,11 @@ class PipelineNode:
                 return True
             if status is None:
                 self.message = None
+                self.preview_text = None
                 self.status = PipelineNodeStatus.DIRTY
                 return True
             self.message = message
+            self.preview_text = preview_text
             self.status = status
             return False
 
@@ -189,6 +206,7 @@ class PipelineNode:
         _seen.add(self)
         with self._lock:
             self.generation += 1
+            self.preview_text = None
             self.status = PipelineNodeStatus.DIRTY
         for child_node in list(self.child_nodes):
             child_node.mark_dirty(_seen)

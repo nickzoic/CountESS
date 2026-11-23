@@ -311,3 +311,24 @@ class LabeledProgressbar(ttk.Progressbar):
             self.done = percentage == 100
             self.config(mode="determinate", value=percentage)
         self.style.configure(self.style_name, text=text)
+
+
+class TextPreviewFrame(tk.Frame):
+    """Some text to look at, which can't be changed (but can be selected and copied), in a fixed width font, with
+    scroll bars, and without wrapping lines round, as what it's for is to show what lines of a file look like."""
+
+    def __init__(self, master: tk.Misc, text: str, **kwargs):
+        super().__init__(master, **kwargs)
+        self.text = tk.Text(self, wrap=tk.NONE, font="TkFixedFont", height=10, width=40, cursor="arrow")
+        y_scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.text.yview)
+        x_scrollbar = ttk.Scrollbar(self, orient=tk.HORIZONTAL, command=self.text.xview)
+        self.text.configure(yscrollcommand=y_scrollbar.set, xscrollcommand=x_scrollbar.set)
+
+        self.text.grid(row=0, column=0, sticky=tk.NSEW)
+        y_scrollbar.grid(row=0, column=1, sticky=tk.NS)
+        x_scrollbar.grid(row=1, column=0, sticky=tk.EW)
+        self.rowconfigure(0, weight=1)
+        self.columnconfigure(0, weight=1)
+
+        self.text.insert("1.0", text)
+        self.text["state"] = tk.DISABLED

@@ -2,6 +2,7 @@ import bz2
 import csv
 import gzip
 import logging
+import tempfile
 from io import BufferedWriter, BytesIO
 from itertools import zip_longest
 from pathlib import Path
@@ -213,6 +214,20 @@ def write_to_csv(
         ddbc.execute(str(query))
 
 
+# how many rows of the data are shown in the preview of CSV Save, which is of what the file will look like
+CSV_PREVIEW_ROWS = 100
+
+
+def csv_text(ddbc: DuckDBPyConnection, source: DuckDBPyRelation, sep: str, quoting: int, header: bool = True) -> str:
+    """The text which `write_to_csv` writes for `source`, which is the same whatever a file is compressed with if it
+    is.  It has `write_to_csv` write a file and reads it back, so it's what the file is and not what some other way
+    of writing it would make (how booleans, numbers, nulls and quotes come out are all up to the writer)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = Path(tmpdir) / "preview.csv"
+        write_to_csv(ddbc, source, str(path), sep=sep, quoting=quoting, header=header)
+        return path.read_text(encoding="utf-8")
+
+
 class SaveCsvPlugin(DuckdbSaveFilePlugin):
     name = "CSV Save"
     description = "Save data as CSV or similar delimited text files"
@@ -232,7 +247,32 @@ class SaveCsvPlugin(DuckdbSaveFilePlugin):
     SEPARATORS = {",": ",", ";": ";", "|": "|", "SPACE": " ", "TAB": "\t"}
     QUOTING = {False: csv.QUOTE_MINIMAL, True: csv.QUOTE_NONNUMERIC}
 
-    show_preview = False
+    def sorted(self, source: DuckDBPyRelation) -> DuckDBPyRelation:
+        """The source in the order that the file is to have it in"""
+        if len(self.sorting) == 0:
+            return source
+        order_by = join(
+            Sql.template("{column} DESC", column=Id(sp.order_by.value)) if sp.descending else Id(sp.order_by.value)
+            for sp in self.sorting
+        )
+        logger.debug("SaveCsvPlugin.sorted order_by %s", order_by)
+        return source.order(str(order_by))
+
+    def preview_text(self, ddbc: DuckDBPyConnection, source: DuckDBPyRelation) -> Optional[str]:
+        """The start of the file as it will be written, with the delimiter, quoting, header and order that it
+        has been set up to have, in place of the table of rows which something which writes a file hasn't got"""
+        total = len(source)
+        text = csv_text(
+            ddbc,
+            self.sorted(source).limit(CSV_PREVIEW_ROWS),
+            sep=self.SEPARATORS[self.delimiter.value],
+            quoting=self.QUOTING[self.quoting.value],
+            header=bool(self.header),
+        )
+        hidden = total - CSV_PREVIEW_ROWS
+        if hidden > 0:
+            text += f"… and {hidden:,} more {'row' if hidden == 1 else 'rows'}\n"
+        return text
 
     def execute(
         self, ddbc: DuckDBPyConnection, source: Optional[DuckDBPyRelation], row_limit: Optional[int] = None
@@ -240,13 +280,7 @@ class SaveCsvPlugin(DuckdbSaveFilePlugin):
         if source is None or row_limit is not None or not self.filename:
             return
 
-        if len(self.sorting):
-            order_by = join(
-                Sql.template("{column} DESC", column=Id(sp.order_by.value)) if sp.descending else Id(sp.order_by.value)
-                for sp in self.sorting
-            )
-            logger.debug("SaveCsvPlugin.execute order_by %s", order_by)
-            source = source.order(str(order_by))
+        source = self.sorted(source)
 
         filename = self.filename.get_file_path()
         Path(filename).parent.mkdir(parents=True, exist_ok=True)
