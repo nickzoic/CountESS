@@ -7,10 +7,10 @@ import countess.core.cmd
 from countess import VERSION
 from countess.core.cmd import configure_graphs, main, run
 
-expected_output = """"thing","result"
-"foo",23512.798828125
+expected_output = """"thing",result
+"foo",23512.799
 "baz",12769.0
-"qux",14728.1142578125
+"qux",14728.114
 """
 
 

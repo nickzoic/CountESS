@@ -75,7 +75,7 @@ def test_save_csv():
 
     with open("tests/output1.csv", "r", encoding="utf-8") as fh:
         text = fh.read()
-        assert text == '"a","b","c"\n1,2.01,"three"\n4,5.5,"six"\n7,8.8,"nine"\n'
+        assert text == 'a,b,"c"\n1,2.01,"three"\n4,5.5,"six"\n7,8.8,"nine"\n'
 
 
 def test_save_csv_gz():
@@ -88,7 +88,7 @@ def test_save_csv_gz():
 
     with gzip.open("tests/output1.csv.gz", "rt") as fh:
         text = fh.read()
-        assert text == '"a","b","c"\n1,2.01,"three"\n4,5.5,"six"\n7,8.8,"nine"\n'
+        assert text == 'a,b,"c"\n1,2.01,"three"\n4,5.5,"six"\n7,8.8,"nine"\n'
 
 
 def test_save_csv_bz2():
@@ -102,6 +102,7 @@ def test_save_csv_bz2():
 
     with bz2.open("tests/output1.csv.bz2", "rt") as fh:
         text = fh.read()
+        # (bz2 isn't something DuckDB can write, so this is still done by pandas, which quotes every name in the header)
         assert text == '"a","b","c"\n1,2.01,"three"\n4,5.5,"six"\n7,8.8,"nine"\n'
 
 
@@ -109,6 +110,7 @@ def test_save_csv_bz2():
 
 
 import csv as csv_module
+import io
 import lzma
 
 import pytest
@@ -138,6 +140,17 @@ def save_csv(connection, path, **params):
     return path.read_text(encoding="utf-8")
 
 
+def save_csv_to(connection, path, source=None, **params):
+    """Saves table t (or `source`) to `path`, where it isn't wanted back as text"""
+    source = connection.table("t") if source is None else source
+    plugin = SaveCsvPlugin()
+    plugin.set_parameter("filename", str(path))
+    for key, value in params.items():
+        plugin.set_parameter(key, value)
+    plugin.prepare(connection, source)
+    assert plugin.execute(connection, source) is None
+
+
 def load_csv(connection, *filenames, **params):
     plugin = LoadCsvPlugin()
     for number, filename in enumerate(filenames):
@@ -151,23 +164,129 @@ def load_csv(connection, *filenames, **params):
 def test_save_delimiters(csv_ddbc, tmp_path, delimiter, sep):
     text = save_csv(csv_ddbc, tmp_path / "out.csv", delimiter=delimiter)
     lines = text.splitlines()
-    assert lines[0] == sep.join(['"n"', '"s"', '"f"'])
+    assert lines[0] == sep.join(["n", '"s"', "f"])
     assert lines[1] == sep.join(["1", '"a b"', "2.5"])
 
 
 def test_quoting_can_be_minimal(csv_ddbc, tmp_path):
     text = save_csv(csv_ddbc, tmp_path / "out.csv", quoting=False)
     assert text == 'n,s,f\n1,a b,2.5\n2,"c,d",3.5\n3,"say ""hi""",\n'
-    # (quoting the non-numbers is done by pandas, which also quotes a missing value: with minimal quoting it's blank)
+    # (quoting the non-numbers always quotes the text, and the names of the columns it's in)
     assert save_csv(csv_ddbc, tmp_path / "out2.csv", quoting=True) == (
-        '"n","s","f"\n1,"a b",2.5\n2,"c,d",3.5\n3,"say ""hi""",""\n'
+        'n,"s",f\n1,"a b",2.5\n2,"c,d",3.5\n3,"say ""hi""",\n'
     )
 
 
 def test_quoting_everything(csv_ddbc, tmp_path):
     path = tmp_path / "all.csv"
-    write_to_csv(csv_ddbc.table("t"), str(path), ",", csv_module.QUOTE_ALL)
+    write_to_csv(csv_ddbc, csv_ddbc.table("t"), str(path), ",", csv_module.QUOTE_ALL)
     assert path.read_text(encoding="utf-8") == '"n","s","f"\n"1","a b","2.5"\n"2","c,d","3.5"\n"3","say ""hi""",\n'
+
+
+# ---- quoting the non-numbers, which is done by DuckDB (except for .bz2 and .xz)
+
+
+def test_only_the_columns_which_are_not_numbers_are_quoted(csv_ddbc, tmp_path):
+    csv_ddbc.sql(
+        "create or replace table t as select 1 as i, 2.5 as d, true as b, 'x' as s, DATE '2024-01-02' as dt,"
+        " TIMESTAMP '2024-01-02 03:04:05' as ts, 7::DECIMAL(5,2) as dc, 8::HUGEINT as h"
+    )
+    lines = save_csv(csv_ddbc, tmp_path / "out.csv").splitlines()
+    assert lines == ['i,d,b,"s","dt","ts",dc,h', '1,2.5,true,"x","2024-01-02","2024-01-02 03:04:05",7.00,8']
+
+
+def test_there_may_be_nothing_to_quote(csv_ddbc, tmp_path):
+    csv_ddbc.sql("create or replace table t as select 1 as a, 2.5 as b")
+    assert save_csv(csv_ddbc, tmp_path / "out.csv") == "a,b\n1,2.5\n"
+
+
+def test_a_missing_value_is_blank_but_an_empty_string_is_quoted(csv_ddbc, tmp_path):
+    csv_ddbc.sql("create or replace table t as select * from (values (1, ''), (2, NULL), (3, 'x')) v(n, s)")
+    lines = save_csv(csv_ddbc, tmp_path / "out.csv").splitlines()
+    assert lines[1:] == ['1,""', "2,", '3,"x"']
+
+
+def test_awkward_text_comes_back_as_it_went(csv_ddbc, tmp_path):
+    awkward = [
+        "a,b",
+        'say "hi"',
+        "two\nlines",
+        "tab\there",
+        "semi;colon",
+        "pipe|bar",
+        "  padded  ",
+        "caf\u00e9 \u2603",
+        "'single'",
+    ]
+    csv_ddbc.create_function("awkward", lambda i: awkward[i], return_type=duckdb.sqltypes.DuckDBPyType("VARCHAR"))
+    csv_ddbc.sql(f"create or replace table t as select range as n, awkward(range) as s from range({len(awkward)})")
+    for delimiter, sep in ((",", ","), (";", ";"), ("|", "|"), ("TAB", "\t")):
+        text = save_csv(csv_ddbc, tmp_path / f"{delimiter}.csv", delimiter=delimiter)
+        rows = list(csv_module.reader(io.StringIO(text, newline=""), delimiter=sep))
+        assert rows[0] == ["n", "s"]
+        assert [row[1] for row in rows[1:]] == awkward, delimiter
+
+
+def test_unusual_column_names_can_be_saved(csv_ddbc, tmp_path):
+    csv_ddbc.sql('create or replace table t as select 1 as "a,b", \'x\' as "we""ird, name", \'y\' as "it\'s"')
+    text = save_csv(csv_ddbc, tmp_path / "out.csv")
+    rows = list(csv_module.reader(io.StringIO(text, newline="")))
+    assert rows == [["a,b", 'we"ird, name', "it's"], ["1", "x", "y"]]
+
+
+def test_a_gzipped_file_is_the_same_as_the_plain_one(csv_ddbc, tmp_path):
+    csv_ddbc.sql("create or replace table t as select range as n, 'text ' || range as s from range(20000)")
+    plain = save_csv(csv_ddbc, tmp_path / "plain.csv")
+    path = tmp_path / "zipped.csv.gz"
+    save_csv_to(csv_ddbc, path)
+    assert path.read_bytes()[:2] == b"\x1f\x8b"  # (it's really gzipped)
+    with gzip.open(path, "rt", encoding="utf-8") as fh:
+        assert fh.read() == plain
+
+
+def test_a_saved_file_loads_back_the_same(csv_ddbc, tmp_path):
+    path = tmp_path / "out.csv.gz"
+    csv_ddbc.sql(
+        "create or replace table t as select * from (values (1, 'a b', 2.5, DATE '2024-01-02'),"
+        " (2, 'c,d', 3.5, DATE '2024-01-03')) v(n, s, f, d)"
+    )
+    save_csv_to(csv_ddbc, path)
+    assert csv_ddbc.sql(f"select * from read_csv('{path}')").fetchall() == csv_ddbc.table("t").fetchall()
+
+
+def test_it_isnt_done_by_pandas(csv_ddbc, tmp_path, monkeypatch):
+    def not_pandas(*args, **kwargs):
+        raise AssertionError("pandas was used to write the file")
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", not_pandas)
+    for name in ("out.csv", "out.csv.gz"):
+        save_csv_to(csv_ddbc, tmp_path / name)
+        assert (tmp_path / name).exists()
+
+
+def test_a_save_which_fails_leaves_nothing_where_there_was_nothing(csv_ddbc, tmp_path):
+    path = tmp_path / "out.csv.gz"
+    with pytest.raises(duckdb.Error):
+        save_csv_to(csv_ddbc, path, source=failing_source(csv_ddbc))
+    assert list(tmp_path.iterdir()) == []  # (not the file and not a temporary file)
+
+
+def test_a_save_which_fails_leaves_the_old_file_as_it_was(csv_ddbc, tmp_path):
+    path = tmp_path / "out.csv"
+    path.write_text("the old file\n", encoding="utf-8")
+    with pytest.raises(duckdb.Error):
+        save_csv_to(csv_ddbc, path, source=failing_source(csv_ddbc))
+    assert path.read_text(encoding="utf-8") == "the old file\n"
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def failing_source(connection):
+    def explode(n: int) -> int:
+        raise RuntimeError("boom")
+
+    connection.create_function("explode", explode)
+    connection.sql("create or replace view failing as select explode(n) as n from t")
+    return connection.table("failing")
 
 
 def test_save_xz(csv_ddbc, tmp_path):
@@ -348,11 +467,11 @@ def test_combining_nothing_gives_nothing(csv_ddbc):
 @pytest.mark.parametrize("quoting", [True, False], ids=["quoting non-numbers", "minimal quoting"])
 @pytest.mark.parametrize("header", [True, False])
 def test_header_row_either_way_and_with_either_kind_of_quoting(csv_ddbc, tmp_path, quoting, header):
-    # (quoting the non-numbers is done by pandas, and minimal quoting by DuckDB: both have to do what they're told)
+    # (both kinds of quoting are done by DuckDB: both have to do what they're told)
     csv_ddbc.sql("create or replace table t as select * from (values (1, 'a'), (2, 'b')) v(n, s)")
     lines = save_csv(csv_ddbc, tmp_path / "out.csv", quoting=quoting, header=header).splitlines()
     assert len(lines) == (3 if header else 2)
-    assert (lines[0] in ('"n","s"', "n,s")) == header
+    assert (lines[0] in ('n,"s"', "n,s")) == header
     assert lines[-1] in ('2,"b"', "2,b")
 
 
@@ -360,7 +479,7 @@ def test_header_row_left_out_when_quoting_everything(csv_ddbc, tmp_path):
     csv_ddbc.sql("create or replace table t as select * from (values (1, 'a'), (2, 'b')) v(n, s)")
     for header, expected_lines in ((True, 3), (False, 2)):
         path = tmp_path / f"all{header}.csv"
-        write_to_csv(csv_ddbc.table("t"), str(path), ",", csv_module.QUOTE_ALL, header=header)
+        write_to_csv(csv_ddbc, csv_ddbc.table("t"), str(path), ",", csv_module.QUOTE_ALL, header=header)
         assert len(path.read_text(encoding="utf-8").splitlines()) == expected_lines
 
 
@@ -385,7 +504,7 @@ def test_the_header_is_written_once_however_many_chunks_there_are(csv_ddbc, tmp_
         text = save_csv(csv_ddbc, tmp_path / f"big{header}.csv", header=header)
         lines = text.splitlines()
         assert len(lines) == 20000 + (1 if header else 0)
-        assert sum(1 for line in lines if line.startswith('"n"')) == (1 if header else 0)
+        assert sum(1 for line in lines if line.startswith("n,")) == (1 if header else 0)
 
 
 def test_every_delimiter_which_is_offered_can_be_saved():

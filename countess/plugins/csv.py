@@ -25,7 +25,15 @@ from countess.core.parameters import (
     TabularMultiParam,
 )
 from countess.core.plugins import DuckdbLoadFileWithTheLotPlugin, DuckdbSaveFilePlugin
-from countess.utils.duckdb import duckdb_dtype_to_datatype_choice, duckdb_escape_identifier, duckdb_source_to_table
+from countess.utils.duckdb import (
+    duckdb_dtype_is_boolean,
+    duckdb_dtype_is_numeric,
+    duckdb_dtype_to_datatype_choice,
+    duckdb_escape_identifier,
+    duckdb_escape_literal,
+    duckdb_source_to_table,
+)
+from countess.utils.files import atomic_output
 
 CSV_FILE_TYPES: Sequence[Tuple[str, Union[str, List[str]]]] = [
     ("CSV", [".csv", ".csv.gz", ".csv.bz2"]),
@@ -160,7 +168,42 @@ class SaveCsvOrderParameter(TabularMultiParam):
     descending = BooleanParam("Descending")
 
 
-def write_to_csv(source: DuckDBPyRelation, filename: str, sep: str, quoting: int, header: bool = True) -> None:
+def copy_to_csv_quoting_non_numerics(
+    ddbc: DuckDBPyConnection, source: DuckDBPyRelation, filename: str, sep: str, header: bool = True
+) -> None:
+    """Write `source` to `filename` with DuckDB, quoting every column which isn't a number (or a boolean), the
+    same as `csv.QUOTE_NONNUMERIC` does.  DuckDB doesn't have a quoting mode for that, but it can be told
+    which columns to always quote, and it's a lot quicker than going via pandas: it formats and compresses
+    in C++, instead of making a DataFrame of every chunk to be formatted a row at a time in Python.
+
+    What it writes isn't quite what pandas did:
+    * DuckDB quotes the names in the header row for the same columns as the values, not all of them.
+    * a missing value is empty, whatever the column.  With pandas a missing number was an empty string in
+      quotes, so couldn't be told from an empty string; now an empty string is `""` and a missing string isn't.
+    * NaN and infinity are `nan` and `inf`, where pandas wrote nothing for NaN, and booleans are `true` and `false`.
+
+    The file is only there once it's all been written."""
+
+    quoted = [
+        duckdb_escape_identifier(name)
+        for name, dtype in zip(source.columns, source.dtypes)
+        if not (duckdb_dtype_is_numeric(dtype) or duckdb_dtype_is_boolean(dtype))
+    ]
+    options = ["FORMAT CSV", f"HEADER {'true' if header else 'false'}", f"DELIMITER {duckdb_escape_literal(sep)}"]
+    if quoted:
+        options.append(f"FORCE_QUOTE ({', '.join(quoted)})")
+    if filename.endswith(".gz"):
+        options.append("COMPRESSION gzip")
+
+    with atomic_output(filename) as temp_filename:
+        query = f"COPY ({source.sql_query()}) TO {duckdb_escape_literal(temp_filename)} ({', '.join(options)})"
+        logger.debug("copy_to_csv_quoting_non_numerics %s", query)
+        ddbc.execute(query)
+
+
+def write_to_csv(
+    ddbc: DuckDBPyConnection, source: DuckDBPyRelation, filename: str, sep: str, quoting: int, header: bool = True
+) -> None:
     logger.debug("writing file %s", filename)
 
     def _write(fh: TextIOBase | gzip.GzipFile | bz2.BZ2File | lzma.LZMAFile, **kwargs):
@@ -183,9 +226,12 @@ def write_to_csv(source: DuckDBPyRelation, filename: str, sep: str, quoting: int
     elif filename.endswith(".xz"):
         with lzma.open(filename, "w") as fh_xz:
             _write(fh_xz, sep=sep, quoting=quoting)
-    elif quoting not in (csv.QUOTE_MINIMAL, csv.QUOTE_ALL):
-        # duckdb doesn't support this properly
+    elif quoting == csv.QUOTE_NONNUMERIC:
+        # duckdb has no quoting mode for this, but it can be told which columns to quote
         # https://github.com/duckdb/duckdb-python/discussions/491
+        copy_to_csv_quoting_non_numerics(ddbc, source, filename, sep, header)
+    elif quoting not in (csv.QUOTE_MINIMAL, csv.QUOTE_ALL):
+        # duckdb doesn't support any of the others
         if filename.endswith(".gz"):
             with gzip.open(filename, "w") as fh_gz:
                 _write(fh_gz, sep=sep, quoting=quoting)
@@ -236,6 +282,7 @@ class SaveCsvPlugin(DuckdbSaveFilePlugin):
         filename = self.filename.get_file_path()
         Path(filename).parent.mkdir(parents=True, exist_ok=True)
         write_to_csv(
+            ddbc,
             source,
             filename,
             sep=self.SEPARATORS[self.delimiter.value],
