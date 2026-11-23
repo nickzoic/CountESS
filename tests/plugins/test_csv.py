@@ -116,6 +116,7 @@ import pytest
 
 from countess.plugins.csv import CSV_DELIMITER_CHOICES, csv_sql_type, write_to_csv
 from countess.utils import compress
+from countess.utils.duckdb import duckdb_escape_identifier, duckdb_escape_literal
 
 
 @pytest.fixture(name="csv_ddbc")
@@ -194,40 +195,6 @@ def test_there_may_be_nothing_to_quote(csv_ddbc, tmp_path):
     assert save_csv(csv_ddbc, tmp_path / "out.csv") == "a,b\n1,2.5\n"
 
 
-def test_a_missing_value_is_blank_but_an_empty_string_is_quoted(csv_ddbc, tmp_path):
-    csv_ddbc.sql("create or replace table t as select * from (values (1, ''), (2, NULL), (3, 'x')) v(n, s)")
-    lines = save_csv(csv_ddbc, tmp_path / "out.csv").splitlines()
-    assert lines[1:] == ['1,""', "2,", '3,"x"']
-
-
-def test_awkward_text_comes_back_as_it_went(csv_ddbc, tmp_path):
-    awkward = [
-        "a,b",
-        'say "hi"',
-        "two\nlines",
-        "tab\there",
-        "semi;colon",
-        "pipe|bar",
-        "  padded  ",
-        "caf\u00e9 \u2603",
-        "'single'",
-    ]
-    csv_ddbc.create_function("awkward", lambda i: awkward[i], return_type=duckdb.sqltypes.DuckDBPyType("VARCHAR"))
-    csv_ddbc.sql(f"create or replace table t as select range as n, awkward(range) as s from range({len(awkward)})")
-    for delimiter, sep in ((",", ","), (";", ";"), ("|", "|"), ("TAB", "\t")):
-        text = save_csv(csv_ddbc, tmp_path / f"{delimiter}.csv", delimiter=delimiter)
-        rows = list(csv_module.reader(io.StringIO(text, newline=""), delimiter=sep))
-        assert rows[0] == ["n", "s"]
-        assert [row[1] for row in rows[1:]] == awkward, delimiter
-
-
-def test_unusual_column_names_can_be_saved(csv_ddbc, tmp_path):
-    csv_ddbc.sql('create or replace table t as select 1 as "a,b", \'x\' as "we""ird, name", \'y\' as "it\'s"')
-    text = save_csv(csv_ddbc, tmp_path / "out.csv")
-    rows = list(csv_module.reader(io.StringIO(text, newline="")))
-    assert rows == [["a,b", 'we"ird, name', "it's"], ["1", "x", "y"]]
-
-
 EXTENSIONS = ["", ".gz", ".bz2", ".xz"]
 OPENERS = {"": open, ".gz": gzip.open, ".bz2": bz2.open, ".xz": lzma.open}
 
@@ -251,6 +218,143 @@ def many_rows(connection, rows=20000):
 def fixture_small_blocks(monkeypatch):
     """So that even a small file is written as a lot of blocks, each of them a complete little file of its own"""
     monkeypatch.setattr(compress, "DEFAULT_BLOCK_SIZE", 4096)
+
+
+# ---- the separators, with both kinds of quoting
+
+DELIMITERS = list(SaveCsvPlugin.SEPARATORS.items())  # (what the plugin is called, what's between the fields)
+EVERY_DELIMITER = pytest.mark.parametrize(
+    "delimiter,sep", DELIMITERS, ids=["comma", "semicolon", "pipe", "space", "tab"]
+)
+BOTH_KINDS_OF_QUOTING = pytest.mark.parametrize(
+    "quoting", [True, False], ids=["quoting non-numbers", "minimal quoting"]
+)
+
+# text which has each of the separators in it, quotes, a newline, nothing at all, and a missing value
+AWKWARD = [
+    "plain",
+    "has,comma",
+    "has;semi",
+    "has|pipe",
+    "has\ttab",
+    "has space",
+    'say "hi"',
+    "",
+    " padded ",
+    "all , ; | \t of them",
+    "caf\u00e9 \u2603",
+    "two\nlines",
+    None,
+]
+# (for what has to be loaded again: not a newline, which can't be loaded; not nothing, which is the same as missing;
+# and not a quote, which comes back doubled as it does from any file, see
+# test_text_with_quotes_in_it_is_not_the_same_after_being_saved_and_loaded)
+LOADABLE = [text for text in AWKWARD if text and "\n" not in text and '"' not in text]
+
+
+def texts_table(connection, texts):
+    """Make table t with a row for each of `texts` (which is a number, the text and half the number)"""
+    values = ", ".join(f"({n}, {duckdb_escape_literal(text)}, {n * 0.5})" for n, text in enumerate(texts))
+    connection.sql(f"create or replace table t as select * from (values {values}) v(n, s, f)")
+
+
+def expected_field(text, sep, quoting):
+    """How a bit of text is written: quoted if everything that isn't a number is quoted, or if it has to be, because
+    it has what's between the fields in it or a quote or a newline, or because it's empty (so as not to be taken
+    for a missing value, which is nothing).  Quotes in it are doubled."""
+    if quoting or sep in text or '"' in text or "\n" in text or text == "":
+        return '"' + text.replace('"', '""') + '"'
+    return text
+
+
+@BOTH_KINDS_OF_QUOTING
+@EVERY_DELIMITER
+def test_what_is_written_for_each_separator_and_kind_of_quoting(csv_ddbc, tmp_path, quoting, delimiter, sep):
+    texts = [text for text in AWKWARD if text is not None and "\n" not in text]
+    texts_table(csv_ddbc, texts)
+    lines = save_csv(csv_ddbc, tmp_path / "out.csv", quoting=quoting, delimiter=delimiter).splitlines()
+    assert lines == [
+        sep.join(["n", '"s"' if quoting else "s", "f"]),
+        *(sep.join([str(n), expected_field(text, sep, quoting), str(n * 0.5)]) for n, text in enumerate(texts)),
+    ]
+
+
+@BOTH_KINDS_OF_QUOTING
+@EVERY_DELIMITER
+def test_a_missing_value_is_blank_but_an_empty_string_is_quoted(csv_ddbc, tmp_path, quoting, delimiter, sep):
+    csv_ddbc.sql("create or replace table t as select * from (values (1, ''), (2, NULL), (3, 'x')) v(n, s)")
+    lines = save_csv(csv_ddbc, tmp_path / "out.csv", quoting=quoting, delimiter=delimiter).splitlines()
+    assert lines[1:] == [f'1{sep}""', f"2{sep}", f"3{sep}" + ('"x"' if quoting else "x")]
+
+
+@BOTH_KINDS_OF_QUOTING
+@EVERY_DELIMITER
+def test_awkward_text_comes_back_as_it_went(csv_ddbc, tmp_path, quoting, delimiter, sep):
+    texts_table(csv_ddbc, AWKWARD)
+    text = save_csv(csv_ddbc, tmp_path / "out.csv", quoting=quoting, delimiter=delimiter)
+    rows = list(csv_module.reader(io.StringIO(text, newline=""), delimiter=sep))
+    assert rows[0] == ["n", "s", "f"]
+    assert all(len(row) == 3 for row in rows)
+    assert [int(row[0]) for row in rows[1:]] == list(range(len(AWKWARD)))
+    assert [row[1] for row in rows[1:]] == [text or "" for text in AWKWARD]  # (missing and empty are both empty)
+    assert [float(row[2]) for row in rows[1:]] == [n * 0.5 for n in range(len(AWKWARD))]
+
+
+@BOTH_KINDS_OF_QUOTING
+@EVERY_DELIMITER
+def test_no_header_row_for_any_separator(csv_ddbc, tmp_path, quoting, delimiter, sep):
+    texts_table(csv_ddbc, ["a b", "c,d"])
+    lines = save_csv(csv_ddbc, tmp_path / "out.csv", quoting=quoting, delimiter=delimiter, header=False).splitlines()
+    assert lines == [
+        sep.join(["0", expected_field("a b", sep, quoting), "0.0"]),
+        sep.join(["1", expected_field("c,d", sep, quoting), "0.5"]),
+    ]
+
+
+@BOTH_KINDS_OF_QUOTING
+@EVERY_DELIMITER
+def test_column_names_with_separators_in_them_come_back_as_they_went(csv_ddbc, tmp_path, quoting, delimiter, sep):
+    names = ["a,b", "c;d", "e|f", "g h", "i\tj", 'k"l']
+    columns = ", ".join(f"{n} as {duckdb_escape_identifier(name)}" for n, name in enumerate(names))
+    csv_ddbc.sql(f"create or replace table t as select {columns}, 'x' as text")
+    text = save_csv(csv_ddbc, tmp_path / "out.csv", quoting=quoting, delimiter=delimiter)
+    rows = list(csv_module.reader(io.StringIO(text, newline=""), delimiter=sep))
+    assert rows == [[*names, "text"], [*(str(n) for n in range(len(names))), "x"]]
+
+
+@BOTH_KINDS_OF_QUOTING
+@EVERY_DELIMITER
+def test_every_kind_of_file_has_the_same_text_for_each_separator(
+    csv_ddbc, tmp_path, monkeypatch, quoting, delimiter, sep
+):
+    # (blocks so small that most of them end in the middle of a row, and some in the middle of a quoted field)
+    monkeypatch.setattr(compress, "DEFAULT_BLOCK_SIZE", 331)
+    texts_table(csv_ddbc, AWKWARD * 25)
+    texts = {}
+    for extension in EXTENSIONS:
+        path = tmp_path / f"out.csv{extension}"
+        save_csv_to(csv_ddbc, path, quoting=quoting, delimiter=delimiter)
+        texts[extension] = read_text(path)
+    assert texts[""].count(sep) >= 2 * len(AWKWARD) * 25
+    assert all(text == texts[""] for text in texts.values())
+
+
+@BOTH_KINDS_OF_QUOTING
+@EVERY_DELIMITER
+@pytest.mark.parametrize("extension", EXTENSIONS)
+def test_a_saved_file_loads_back_the_same_for_each_separator(csv_ddbc, tmp_path, quoting, delimiter, sep, extension):
+    texts_table(csv_ddbc, LOADABLE)
+    path = tmp_path / f"out.csv{extension}"
+    save_csv_to(csv_ddbc, path, quoting=quoting, delimiter=delimiter)
+    _, output = load_csv(csv_ddbc, path, delimiter=delimiter)
+    assert output.fetchall() == [(n, text, n * 0.5) for n, text in enumerate(LOADABLE)]
+
+
+def test_unusual_column_names_can_be_saved(csv_ddbc, tmp_path):
+    csv_ddbc.sql('create or replace table t as select 1 as "a,b", \'x\' as "we""ird, name", \'y\' as "it\'s"')
+    text = save_csv(csv_ddbc, tmp_path / "out.csv")
+    rows = list(csv_module.reader(io.StringIO(text, newline="")))
+    assert rows == [["a,b", 'we"ird, name', "it's"], ["1", "x", "y"]]
 
 
 @pytest.mark.parametrize("quoting", [True, False], ids=["quoting non-numbers", "minimal quoting"])
