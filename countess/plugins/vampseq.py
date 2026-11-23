@@ -6,7 +6,7 @@ from duckdb import DuckDBPyConnection, DuckDBPyRelation
 from countess import VERSION
 from countess.core.parameters import FloatParam, MultiColumnChoiceParam, PerNumericColumnArrayParam, TabularMultiParam
 from countess.core.plugins import DuckdbSqlPlugin
-from countess.utils.duckdb import duckdb_escape_identifier, duckdb_escape_literal
+from countess.utils.sql import EMPTY, Id, Lit, Raw, Sql, join
 
 logger = logging.getLogger(__name__)
 
@@ -37,41 +37,83 @@ class VampSeqScorePlugin(DuckdbSqlPlugin):
         if source is not None:
             self.group_by.set_choices([c for c in source.columns if c not in weight_cols])
 
-    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[str]:
-        group_cols = {duckdb_escape_identifier(name) for name in self.group_by.get_values()}
-        weighted_columns = {
-            duckdb_escape_identifier(name): duckdb_escape_literal(param.weight.value)
+    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[Sql]:
+        group_names = sorted(self.group_by.get_values())
+        weights = {
+            name: param.weight.value
             for name, param in self.columns.get_column_params()
             if param.weight.value is not None
         }
 
-        if not weighted_columns:
+        if not weights:
             return None
 
-        inner_select = ", ".join(
-            [f"T0.{k}" for k in group_cols] + [f"sum(T0.{k}) as {k}" for k in weighted_columns.keys()]
+        # Var is the table, Tot is the total of each of the counts over each group (or everything)
+        inner_select = join(
+            [Id.dotted("T0", name) for name in group_names]
+            + [Sql.template("sum({count}) AS {total}", count=Id.dotted("T0", name), total=Id(name)) for name in weights]
         )
 
-        total_counts = "+".join(f"Var.{k}" for k in weighted_columns.keys())
-        total_sum_counts = " + ".join(f"Tot.{k}" for k in weighted_columns.keys())
-        total_freq = f"({total_counts})/({total_sum_counts})"
-
-        weighted_freqs = " + ".join(
-            f"CASE WHEN Tot.{k} > 0 THEN Var.{k} * {v} / Tot.{k} ELSE 0 END" for k, v in weighted_columns.items()
+        total_freq = Sql.template(
+            "({counts}) / ({totals})",
+            counts=join((Id.dotted("Var", name) for name in weights), sep=" + "),
+            totals=join((Id.dotted("Tot", name) for name in weights), sep=" + "),
         )
-        unweighted_freqs = " + ".join(
-            f"CASE WHEN Tot.{k} > 0 THEN Var.{k} / Tot.{k} ELSE 0 END" for k in weighted_columns.keys()
-        )
-        group_by = ("GROUP BY " + ",".join(group_cols)) if group_cols else ""
-        join_on = (" AND ".join(f"Var.{c} = Tot.{c}" for c in group_cols)) if group_cols else "1=1"
 
-        return f"""
-            SELECT Var.*, ({weighted_freqs}) / ({unweighted_freqs}) as score,
-                {total_freq} AS total_freq
-            FROM {table_name} Var JOIN (
+        weighted_freqs = join(
+            (
+                Sql.template(
+                    "CASE WHEN {tot} > 0 THEN {var} * {weight} / {tot} ELSE 0 END",
+                    tot=Id.dotted("Tot", name),
+                    var=Id.dotted("Var", name),
+                    weight=Lit(weight),
+                )
+                for name, weight in weights.items()
+            ),
+            sep=" + ",
+        )
+        unweighted_freqs = join(
+            (
+                Sql.template(
+                    "CASE WHEN {tot} > 0 THEN {var} / {tot} ELSE 0 END",
+                    tot=Id.dotted("Tot", name),
+                    var=Id.dotted("Var", name),
+                )
+                for name in weights
+            ),
+            sep=" + ",
+        )
+        group_by = (
+            Sql.template("GROUP BY {cols}", cols=join(Id(name) for name in group_names)) if group_names else EMPTY
+        )
+        join_on = (
+            join(
+                (
+                    Sql.template("{var} = {tot}", var=Id.dotted("Var", name), tot=Id.dotted("Tot", name))
+                    for name in group_names
+                ),
+                sep=" AND ",
+            )
+            if group_names
+            else Raw("1=1")
+        )
+
+        return Sql.template(
+            """
+            SELECT Var.*, ({weighted_freqs}) / ({unweighted_freqs}) AS score, {total_freq} AS total_freq
+            FROM {table} Var JOIN (
                 SELECT {inner_select}
-                FROM {table_name} T0
+                FROM {table} T0
                 {group_by}
             ) Tot ON {join_on}
-            WHERE total_freq > {duckdb_escape_literal(self.threshold.value)}
-        """
+            WHERE total_freq > {threshold}
+            """,
+            weighted_freqs=weighted_freqs,
+            unweighted_freqs=unweighted_freqs,
+            total_freq=total_freq,
+            table=Id(table_name),
+            inner_select=inner_select,
+            group_by=group_by,
+            join_on=join_on,
+            threshold=Lit(self.threshold.value),
+        )

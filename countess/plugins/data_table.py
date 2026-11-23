@@ -6,7 +6,7 @@ from duckdb import DuckDBPyConnection, DuckDBPyRelation
 from countess import VERSION
 from countess.core.parameters import ArrayParam, DataTypeChoiceParam, MultiParam, StringParam, TabularMultiParam
 from countess.core.plugins import DuckdbInputPlugin
-from countess.utils.duckdb import duckdb_escape_identifier, duckdb_escape_literal
+from countess.utils.sql import Id, Lit, Sql, join
 
 logger = logging.getLogger(__name__)
 
@@ -74,12 +74,10 @@ class DataTablePlugin(DuckdbInputPlugin):
         if len(self.rows) == 0:
             return None
 
-        values_str = ", ".join(
-            "(" + (", ".join(duckdb_escape_literal(val.value) for val in row.values())) + ")" for row in self.rows
+        rows = join(
+            Sql.template("({values})", values=join(Lit(val.value) for val in row.values())) for row in self.rows
         )
-        columns_str = ",".join(duckdb_escape_identifier(col.name.value) for col in self.columns)
-        sql = f"SELECT * FROM (VALUES {values_str}) _({columns_str})"
+        columns = join(Id(col.name.value) for col in self.columns)
+        sql = Sql.template("SELECT * FROM (VALUES {rows}) _({columns})", rows=rows, columns=columns)
 
-        logger.debug("DataTablePlugin.execute sql %s", sql)
-
-        return ddbc.sql(sql)
+        return sql.relation(ddbc)

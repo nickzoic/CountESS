@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 import pypeg2  # type: ignore[import-untyped]
 
-from countess.utils.duckdb import duckdb_escape_identifier, duckdb_escape_literal
+from countess.utils.sql import Id, Lit
 
 logger = logging.getLogger(__name__)
 
@@ -95,35 +95,35 @@ class DecimalLiteral(SqlTemplatingSymbol):
     regex = re.compile(r"[0-9]+\.[0-9]+")
 
     def sql(self):
-        return duckdb_escape_literal(Decimal(self.name))
+        return str(Lit(Decimal(self.name)))
 
 
 class SingleQuotedStringLiteral(SqlTemplatingSymbol):
     regex = re.compile(r"'[^'\\]*(?:\\.[^'\\]*)*'")
 
     def sql(self):
-        return duckdb_escape_literal(ast.literal_eval(self.name))
+        return str(Lit(ast.literal_eval(self.name)))
 
 
 class DoubleQuotedStringLiteral(SqlTemplatingSymbol):
     regex = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"')
 
     def sql(self):
-        return duckdb_escape_literal(ast.literal_eval(self.name))
+        return str(Lit(ast.literal_eval(self.name)))
 
 
 class Label(SqlTemplatingSymbol):
     regex = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
 
     def sql(self):
-        return duckdb_escape_identifier(self.name)
+        return str(Id(self.name))
 
 
 class BacktickQuotedLabel(SqlTemplatingSymbol):
     regex = re.compile(r"`[^`\n]*`")
 
     def sql(self):
-        return duckdb_escape_identifier(self.name[1:-1])
+        return str(Id(self.name[1:-1]))
 
 
 class SqlTemplatingList(pypeg2.List):

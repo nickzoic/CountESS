@@ -24,7 +24,7 @@ from countess.core.parameters import (
     StringParam,
 )
 from countess.core.plugins import DuckdbSqlPlugin
-from countess.utils.duckdb import duckdb_escape_identifier, duckdb_escape_literal
+from countess.utils.sql import Fn, Fragment, Id, Lit, Raw, Sql, join
 
 logger = logging.getLogger(__name__)
 
@@ -212,71 +212,100 @@ class VariantPlugin(DuckdbSqlPlugin):
             )
         return super().execute(ddbc, source, row_limit)
 
-    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[str]:
+    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[Sql]:
         columns = list(columns)
         outputs = self.output_fields()
         removed = {c for c in self.remove_fields(columns) if c}
         kept_columns = [c for c in columns if c not in removed]
+        table = Id(table_name)
 
         if not outputs:
-            return f"SELECT {', '.join(duckdb_escape_identifier(c) for c in kept_columns) or '*'} FROM {table_name}"
+            kept: Fragment = join(Id(c) for c in kept_columns) or Raw("*")
+            return Sql.template("SELECT {columns} FROM {table}", columns=kept, table=table)
 
         # The inputs to the UDF.  Anything which is a constant (the reference, perhaps the offsets) isn't
         # part of the key, as it's the same for every row, and `call` doesn't look at it.
-        sequence_expr = f"CAST(S.{duckdb_escape_identifier(self.column.value)} AS VARCHAR)"
-        keys = {"k_sequence": sequence_expr}
-        args = {"k_sequence": "k_sequence", "k_reference": "''", "k_dna_offset": "0", "k_protein_offset": "0"}
+        sequence_expr = Sql.template("CAST({column} AS VARCHAR)", column=Id.dotted("S", self.column.value))
+        keys: dict[str, Fragment] = {"k_sequence": sequence_expr}
+        args: dict[str, Fragment] = {
+            "k_sequence": Id("k_sequence"),
+            "k_reference": Lit(""),
+            "k_dna_offset": Lit(0),
+            "k_protein_offset": Lit(0),
+        }
 
         if reference_column := self.reference.get_column_name():
-            keys["k_reference"] = f"CAST(S.{duckdb_escape_identifier(reference_column)} AS VARCHAR)"
+            keys["k_reference"] = Sql.template("CAST({column} AS VARCHAR)", column=Id.dotted("S", reference_column))
         if dna_offset_column := self.variant.offset.get_column_name():
-            keys["k_dna_offset"] = f"COALESCE(CAST(S.{duckdb_escape_identifier(dna_offset_column)} AS BIGINT), 0)"
+            keys["k_dna_offset"] = Sql.template(
+                "COALESCE(CAST({column} AS BIGINT), 0)", column=Id.dotted("S", dna_offset_column)
+            )
         if protein_offset_column := self.protein.offset.get_column_name():
-            keys[
-                "k_protein_offset"
-            ] = f"COALESCE(CAST(S.{duckdb_escape_identifier(protein_offset_column)} AS BIGINT), 0)"
+            keys["k_protein_offset"] = Sql.template(
+                "COALESCE(CAST({column} AS BIGINT), 0)", column=Id.dotted("S", protein_offset_column)
+            )
         for key in keys:
-            args[key] = key
+            args[key] = Id(key)
 
         # There's nothing to call if there's no sequence or no reference (see `transform`): those rows
         # don't match anything in the join, so the whole row comes out NULL, as it always has.
-        nothing_to_call = [f"({keys['k_sequence']} IS NOT NULL AND {keys['k_sequence']} != '')"]
+        nothing_to_call: list[Fragment] = [Sql.template("({key} IS NOT NULL AND {key} != '')", key=keys["k_sequence"])]
         if "k_reference" in keys:
-            nothing_to_call.append(f"({keys['k_reference']} IS NOT NULL AND {keys['k_reference']} != '')")
+            nothing_to_call.append(Sql.template("({key} IS NOT NULL AND {key} != '')", key=keys["k_reference"]))
         elif not self.reference.get_value_from_dict({}):
-            nothing_to_call.append("FALSE")
+            nothing_to_call.append(Raw("FALSE"))
 
-        key_select = ", ".join(f"{expr} AS {key}" for key, expr in keys.items())
-        join_on = " AND ".join(f"{expr} = C.{key}" for key, expr in keys.items())
+        key_select = join(Sql.template("{expr} AS {key}", expr=expr, key=Id(key)) for key, expr in keys.items())
+        join_on = join(
+            (Sql.template("{expr} = {column}", expr=expr, column=Id.dotted("C", key)) for key, expr in keys.items()),
+            sep=" AND ",
+        )
 
         # Output columns replace input columns of the same name where there are any, otherwise they
         # go at the end.
-        called = {name: f"struct_extract(C._result, {duckdb_escape_literal(name)})" for name in outputs}
+        called: dict[str, Fragment] = {
+            name: Sql.template("struct_extract({result}, {name})", result=Id.dotted("C", "_result"), name=Lit(name))
+            for name in outputs
+        }
 
-        def select_column(column: str) -> str:
-            column_id = duckdb_escape_identifier(column)
+        def select_column(column: str) -> Fragment:
             if column in called:
-                return f"{called[column]} AS {column_id}"
+                return Sql.template("{expr} AS {name}", expr=called[column], name=Id(column))
             # (no match in the join means there was nothing to call, which blanks the whole row)
-            return f"CASE WHEN C.k_sequence IS NOT NULL THEN S.{column_id} END AS {column_id}"
+            return Sql.template(
+                "CASE WHEN {key} IS NOT NULL THEN {value} END AS {name}",
+                key=Id.dotted("C", "k_sequence"),
+                value=Id.dotted("S", column),
+                name=Id(column),
+            )
 
         select_list = [select_column(c) for c in kept_columns]
         select_list += [
-            f"{expr} AS {duckdb_escape_identifier(name)}" for name, expr in called.items() if name not in kept_columns
+            Sql.template("{expr} AS {name}", expr=expr, name=Id(name))
+            for name, expr in called.items()
+            if name not in kept_columns
         ]
-        udf_args = ", ".join(args[k] for k in ("k_sequence", "k_reference", "k_dna_offset", "k_protein_offset"))
 
-        return f"""
+        return Sql.template(
+            """
             WITH _source AS MATERIALIZED (
-                SELECT * FROM {table_name}
+                SELECT * FROM {table}
             ), _keys AS (
-                SELECT DISTINCT {key_select} FROM _source AS S WHERE {' AND '.join(nothing_to_call)}
+                SELECT DISTINCT {key_select} FROM _source AS S WHERE {nothing_to_call}
             ), _called AS (
-                SELECT *, {self.function_name}({udf_args}) AS _result FROM _keys
+                SELECT *, {function}({udf_args}) AS _result FROM _keys
             )
-            SELECT {', '.join(select_list)}
+            SELECT {select_list}
             FROM _source AS S LEFT JOIN _called AS C ON {join_on}
-        """
+            """,
+            table=table,
+            key_select=key_select,
+            nothing_to_call=join(nothing_to_call, sep=" AND "),
+            function=Fn(self.function_name),
+            udf_args=join(args[k] for k in ("k_sequence", "k_reference", "k_dna_offset", "k_protein_offset")),
+            select_list=join(select_list),
+            join_on=join_on,
+        )
 
 
 class VariantClassifier(DuckdbSqlPlugin):
@@ -287,9 +316,9 @@ class VariantClassifier(DuckdbSqlPlugin):
 
     variant_col = ColumnChoiceParam("Protein variant Column", "variant")
 
-    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[str]:
-        variant_col_id = duckdb_escape_identifier(self.variant_col.value)
-        output_col_id = duckdb_escape_identifier(self.variant_col + "_type")
+    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[Sql]:
+        variant = Id(self.variant_col.value)
+        output = Id(self.variant_col + "_type")
 
         # the nested query stops any of the pattern matching columns
         # from colliding with source table columns, plus hopefully
@@ -300,22 +329,20 @@ class VariantClassifier(DuckdbSqlPlugin):
 
         hgvs_aa_re = "(?:" + "|".join(v for v in AA_CODES.values() if v != "Ter") + ")"
         short_aa_re = "[" + "".join(k for k in AA_CODES if k != "*") + "]"
-        plugin_label = duckdb_escape_literal(self.name + ": ")
 
-        classifier_re = duckdb_escape_literal(
-            re.sub(
-                r"\s+",
-                "",
-                rf"""
+        classifier_re = re.sub(
+            r"\s+",
+            "",
+            rf"""
             ^(_?[Ww][Tt]|p.=)$|
             ^p.{hgvs_aa_re}\d+({hgvs_aa_re}|=|del|dup|Ter)$|
             ^p.{hgvs_aa_re}\d+_{hgvs_aa_re}\d+(del|dup|ins{hgvs_aa_re}+)$|
             ^({short_aa_re})\d+({short_aa_re}|[=*X-])$
         """,
-            )
         )
 
-        return rf"""
+        return Sql.template(
+            r"""
             select S.*, case
                when T.wildtype != '' then 'W'
                when T.hgvs_1 = '=' then 'S'
@@ -335,31 +362,38 @@ class VariantClassifier(DuckdbSqlPlugin):
                end
                else warning(concat({plugin_label},
                    'unclassifiable variant: "', z, '"'), '?')
-               end as {output_col_id}
-            from {table_name} S join (
-                select {variant_col_id} as z, unnest(regexp_extract(
-                    {variant_col_id},
+               end as {output}
+            from {table} S join (
+                select {variant} as z, unnest(regexp_extract(
+                    {variant},
                     {classifier_re},
                     ['wildtype','hgvs_1','hgvs_2','short_1', 'short_2']
                 ))
-                from {table_name}
+                from {table}
                 group by z
-            ) T on S.{variant_col_id} = T.z
-        """
+            ) T on {source_variant} = T.z
+            """,
+            plugin_label=Lit(self.name + ": "),
+            output=output,
+            table=Id(table_name),
+            variant=variant,
+            classifier_re=Lit(classifier_re),
+            source_variant=Id.dotted("S", self.variant_col.value),
+        )
 
 
-def _translate_aa(expr: str, expr1: str = "") -> str:
+def _translate_aa(expr: Fragment, expr1: Optional[Fragment] = None) -> Sql:
+    """A CASE which turns the one letter code in `expr` into the three letter one (or, if there's an `expr1`, which
+    gives = if they are the same)"""
     # This looks ludicrous but it pushes all the work down into SQL so that
     # duckdb can run it without translating rows into Python etc.
-    return (
-        "CASE "
-        + (f"WHEN {expr}={expr1} THEN '='" if expr1 else "")
-        + " ".join(
-            f"WHEN {expr}={duckdb_escape_literal(k)} THEN {duckdb_escape_literal(v)}"
-            for k, v in list(AA_CODES.items()) + [("X", "Ter"), ("-", "del")]
-        )
-        + " ELSE NULL END"
-    )
+    whens = [
+        Sql.template("WHEN {expr} = {code} THEN {name}", expr=expr, code=Lit(k), name=Lit(v))
+        for k, v in list(AA_CODES.items()) + [("X", "Ter"), ("-", "del")]
+    ]
+    if expr1 is not None:
+        whens.insert(0, Sql.template("WHEN {expr} = {expr1} THEN '='", expr=expr, expr1=expr1))
+    return Sql.template("CASE {whens} ELSE NULL END", whens=join(whens, sep=" "))
 
 
 class VariantConverter(DuckdbSqlPlugin):
@@ -373,26 +407,39 @@ class VariantConverter(DuckdbSqlPlugin):
     prefix_nt = StringParam("Variant NT Prefix", "")
     offset = IntegerParam("Variant Location Offset", 0)
 
-    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[str]:
-        variant_col_id = duckdb_escape_identifier(self.variant_col.value)
-        output_col_id = duckdb_escape_identifier(self.variant_out.value)
-        offset = duckdb_escape_literal(self.offset.value) if self.offset else 0
-        prefix_aa = duckdb_escape_literal((self.prefix_aa.value + ":" if self.prefix_aa else "") + "p.")
-        prefix_nt = duckdb_escape_literal((self.prefix_nt.value + ":" if self.prefix_nt else "") + "c.")
+    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[Sql]:
+        variant = Id(self.variant_col.value)
+        output = Id(self.variant_out.value)
+        offset = Lit(self.offset.value)
+        prefix_aa = Lit((self.prefix_aa.value + ":" if self.prefix_aa else "") + "p.")
+        prefix_nt = Lit((self.prefix_nt.value + ":" if self.prefix_nt else "") + "c.")
 
-        columns = " ".join(duckdb_escape_identifier(c) + "," for c in columns if c != self.variant_out.value)
+        # (the first and last letter, the digits between them, and everything after syn_)
+        first = Sql.template("{variant}[1]", variant=variant)
+        last = Sql.template("{variant}[-1]", variant=variant)
+        digits = Sql.template("{variant}[2:-2]", variant=variant)
+        after_syn = Sql.template("{variant}[5:]", variant=variant)
 
         # XXX handle other short forms like _synNNNX>Y or whatever
-        return rf"""
-            SELECT {columns}
-            CASE
-                WHEN regexp_matches({variant_col_id}, 'wt', 'i') THEN {prefix_aa} || '='
-                WHEN regexp_matches({variant_col_id}, '[A-Z]\d+[*A-Z-]')
-                    THEN {prefix_aa} || {_translate_aa(variant_col_id + "[1]")} ||
-                        ({variant_col_id}[2:-2]::INTEGER + {offset})::TEXT ||
-                        {_translate_aa(variant_col_id + "[-1]", variant_col_id + "[1]")}
-                WHEN regexp_matches({variant_col_id}, 'syn_\d+[A-Z]>[A-Z]')
-                    THEN {prefix_nt} || {variant_col_id}[5:]
+        converted = Sql.template(
+            r"""CASE
+                WHEN regexp_matches({variant}, 'wt', 'i') THEN {prefix_aa} || '='
+                WHEN regexp_matches({variant}, '[A-Z]\d+[*A-Z-]')
+                    THEN {prefix_aa} || {first_aa} || ({digits}::INTEGER + {offset})::TEXT || {last_aa}
+                WHEN regexp_matches({variant}, 'syn_\d+[A-Z]>[A-Z]')
+                    THEN {prefix_nt} || {after_syn}
                 ELSE NULL
-            END AS {output_col_id} FROM {table_name}
-        """
+            END AS {output}""",
+            variant=variant,
+            prefix_aa=prefix_aa,
+            first_aa=_translate_aa(first),
+            digits=digits,
+            offset=offset,
+            last_aa=_translate_aa(last, first),
+            prefix_nt=prefix_nt,
+            after_syn=after_syn,
+            output=output,
+        )
+
+        fields = join([*(Id(c) for c in columns if c != self.variant_out.value), converted])
+        return Sql.template("SELECT {fields} FROM {table}", fields=fields, table=Id(table_name))

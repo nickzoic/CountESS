@@ -11,6 +11,7 @@ from typing import Iterable, Optional
 import duckdb
 
 from countess.core.plugins import BasePlugin, DuckdbPlugin, get_plugin_classes
+from countess.utils.sql import Id, Sql
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +140,7 @@ class PipelineNode:
 
         try:
             if ddbc and self.table_name:
-                ddbc.sql(f"DROP TABLE IF EXISTS {self.table_name}")
+                Sql.template("DROP TABLE IF EXISTS {table}", table=Id(self.table_name)).relation(ddbc)
 
             sources = {pn.name: ddbc.table(pn.table_name) for pn in list(self.parent_nodes) if pn.table_name}
             self.plugin.prepare_multi(ddbc, sources)

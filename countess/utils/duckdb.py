@@ -1,10 +1,11 @@
-import decimal
 import logging
 import secrets
 from typing import Iterable, Optional, Union
 
 from duckdb import DuckDBPyConnection, DuckDBPyRelation
 from duckdb.sqltypes import DuckDBPyType
+
+from countess.utils.sql import Id, Lit, Sql, join
 
 logger = logging.getLogger(__name__)
 
@@ -48,48 +49,34 @@ def duckdb_dtype_to_datatype_choice(dtype: DuckDBPyType) -> str:
 
 
 def duckdb_escape_identifier(identifier: str) -> str:
+    """Deprecated: it's countess.utils.sql.Id, which is what this uses, but this lets a None through (and an
+    Id doesn't: a name which isn't there is an SqlError)."""
     if identifier is None:
         return None
-    return '"' + identifier.replace('"', '""') + '"'
+    return str(Id(identifier))
 
 
 def duckdb_escape_literal(literal: Union[str, int, float, list, None]) -> str:
-    # XXX this shouldn't be a thing *BUT* not all functions seem to accept parameter
-    # bindings, or at least it isn't clearly documented as such.
-    if literal is None:
-        return "NULL"
-    elif type(literal) is str:
-        return "'" + literal.replace("'", "''") + "'"
-    elif type(literal) is int:
-        return str(literal)
-    elif type(literal) is float:
-        return str(literal) + "::DOUBLE"
-    elif type(literal) is decimal.Decimal:
-        _sign, digits, exponent = literal.as_tuple()
-        if exponent >= 0:
-            return f"{literal}::DECIMAL({len(digits)+exponent},0)"
-        elif -exponent > len(digits):
-            return f"{literal}::DECIMAL({-exponent},{-exponent})"
-        else:
-            return f"{literal}::DECIMAL({len(digits)},{-exponent})"
-    elif type(literal) is bool:
-        return "TRUE" if literal else "FALSE"
-    elif type(literal) is list:
-        return "[" + ",".join(duckdb_escape_literal(x) for x in literal) + "]"
-    else:
-        raise TypeError("can't escape literal of type %s" % type(literal))
+    """Deprecated: use countess.utils.sql.Lit, which is what this uses.
+
+    XXX this shouldn't be a thing *BUT* not all functions seem to accept parameter bindings (they can't be in a
+    view, or in a PIVOT, or be an identifier), or at least it isn't clearly documented as such."""
+    return str(Lit(literal))
 
 
 def duckdb_combine(ddbc: DuckDBPyConnection, sources: Iterable[DuckDBPyRelation]) -> Optional[DuckDBPyRelation]:
     """Combine several tables into a new table using UNION ALL BY NAME"""
 
-    sql = " UNION ALL BY NAME ".join(f"SELECT * FROM {source.alias}" for source in sources if source is not None)
+    sql = join(
+        (Sql.template("SELECT * FROM {table}", table=Id(source.alias)) for source in sources if source is not None),
+        sep=" UNION ALL BY NAME ",
+    )
     if not sql:
         # there are no sources, and we can't have a table without columns, so we have to return None.
         return None
 
     logger.debug("duckdb_combine %s", sql)
-    return duckdb_source_to_view(ddbc, ddbc.sql(sql))
+    return duckdb_source_to_view(ddbc, sql.relation(ddbc))
 
 
 def duckdb_source_to_view(cursor: DuckDBPyConnection, source: DuckDBPyRelation, view_name: Optional[str] = None):

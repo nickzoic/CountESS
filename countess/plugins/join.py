@@ -8,7 +8,8 @@ from duckdb.sqltypes import DuckDBPyType
 from countess import VERSION
 from countess.core.parameters import ArrayParam, BooleanParam, ColumnChoiceParam, ColumnOrNoneChoiceParam, MultiParam
 from countess.core.plugins import DuckdbPlugin
-from countess.utils.duckdb import duckdb_dtype_is_numeric, duckdb_escape_identifier
+from countess.utils.duckdb import duckdb_dtype_is_numeric
+from countess.utils.sql import Fragment, Id, Lit, Raw, Sql, join
 
 logger = logging.getLogger(__name__)
 
@@ -24,16 +25,22 @@ _NESTED_TYPE_IDS = {"list", "array", "struct", "map", "union"}
 def _common_type(ddbc: DuckDBPyConnection, left_type: DuckDBPyType, right_type: DuckDBPyType) -> Optional[str]:
     """The type which DuckDB would combine two types into (so INTEGER and DOUBLE make DOUBLE, DATE and TIMESTAMP make
     TIMESTAMP), or None if it can't."""
+    # (the types are written by DuckDB, so are fine as they are, nested ones like STRUCT(a INTEGER) as well)
+    query = Sql.template(
+        "SELECT typeof(CASE WHEN true THEN NULL::{left} ELSE NULL::{right} END)",
+        left=Raw(str(left_type)),
+        right=Raw(str(right_type)),
+    )
     try:
-        row = ddbc.sql(f"SELECT typeof(CASE WHEN true THEN NULL::{left_type} ELSE NULL::{right_type} END)").fetchone()
+        row = query.relation(ddbc).fetchone()
     except duckdb.Error:
         return None
     return row[0] if row else None
 
 
 def _comparable(
-    ddbc: DuckDBPyConnection, left: str, left_type: DuckDBPyType, right: str, right_type: DuckDBPyType
-) -> tuple[str, str]:
+    ddbc: DuckDBPyConnection, left: Fragment, left_type: DuckDBPyType, right: Fragment, right_type: DuckDBPyType
+) -> tuple[Fragment, Fragment]:
     """Given SQL expressions for two columns and their types, work out from the types alone (without running
     anything) what to compare, returning an expression for each which can be compared with `=`, or raise
     JoinTypeError if there's no sensible way to do that.
@@ -54,13 +61,16 @@ def _comparable(
         other_type = right_type if left_is_text else left_type
         if other_type.id not in _NESTED_TYPE_IDS:
             if left_is_text:
-                return f"TRY_CAST({left} AS {other_type})", right
-            return left, f"TRY_CAST({right} AS {other_type})"
+                return Sql.template("TRY_CAST({value} AS {type})", value=left, type=Raw(str(other_type))), right
+            return left, Sql.template("TRY_CAST({value} AS {type})", value=right, type=Raw(str(other_type)))
     elif common := _common_type(ddbc, left_type, right_type):
-        return (
-            left if str(left_type) == common else f"CAST({left} AS {common})",
-            right if str(right_type) == common else f"CAST({right} AS {common})",
-        )
+
+        def converted(value: Fragment, value_type: DuckDBPyType) -> Fragment:
+            if str(value_type) == common:
+                return value
+            return Sql.template("CAST({value} AS {type})", value=value, type=Raw(common))
+
+        return converted(left, left_type), converted(right, right_type)
 
     raise JoinTypeError(f"can't compare {left_type} with {right_type}")
 
@@ -120,8 +130,8 @@ class JoinPlugin(DuckdbPlugin):
         tables = list(sources.values())
         required = [input_.required.value for input_ in self.inputs]
 
-        select_str = ", ".join(
-            f"N_{num}.{duckdb_escape_identifier(cname)}"
+        select = join(
+            Id.dotted(f"N_{num}", cname)
             for num, table in enumerate(tables)
             for cname in table.columns
             if not (
@@ -144,7 +154,7 @@ class JoinPlugin(DuckdbPlugin):
         column_types = [dict(zip(table.columns, table.dtypes)) for table in tables]
         labels = list(sources.keys())
 
-        def join_condition(num: int) -> str:
+        def join_condition(num: int) -> Sql:
             """Compare the join column(s) of table 0 with those of table `num`, working out up front how to do
             that so there's no need to run the join to find out if it can be done."""
             conditions = []
@@ -153,8 +163,8 @@ class JoinPlugin(DuckdbPlugin):
                 if attr != "join_on" and not (left_param.is_not_none() and right_param.is_not_none()):
                     continue
                 left_name, right_name = left_param.value, right_param.value
-                left = f"N_0.{duckdb_escape_identifier(left_name)}"
-                right = f"N_{num}.{duckdb_escape_identifier(right_name)}"
+                left: Fragment = Id.dotted("N_0", left_name)
+                right: Fragment = Id.dotted(f"N_{num}", right_name)
                 if left_name in column_types[0] and right_name in column_types[num]:
                     try:
                         left, right = _comparable(
@@ -164,18 +174,26 @@ class JoinPlugin(DuckdbPlugin):
                         raise JoinTypeError(
                             f"Can't join {labels[0]}.{left_name} to {labels[num]}.{right_name}: {exc}"
                         ) from exc
-                conditions.append(f"{left} = {right}")
-            return " AND ".join(conditions)
+                conditions.append(Sql.template("{left} = {right}", left=left, right=right))
+            return join(conditions, sep=" AND ")
 
-        query = f"SELECT {select_str} FROM {tables[0].alias} AS N_0"
+        query = Sql.template(
+            "SELECT {select} FROM {table} AS {alias}", select=select, table=Id(tables[0].alias), alias=Id("N_0")
+        )
         for num, table in enumerate(tables[1:], 1):
-            join_how = _join_how(required[0], required[num])
-            query += f" {join_how} JOIN {table.alias} AS N_{num} ON {join_condition(num)}"
+            query = Sql.template(
+                "{query} {how} JOIN {table} AS {alias} ON {on}",
+                query=query,
+                how=Raw(_join_how(required[0], required[num])),
+                table=Id(table.alias),
+                alias=Id(f"N_{num}"),
+                on=join_condition(num),
+            )
 
         if row_limit is not None:
-            query += f" LIMIT {row_limit}"
+            query = Sql.template("{query} LIMIT {limit}", query=query, limit=Lit(row_limit))
 
         logger.debug("JoinPlugin.execute_multi tables %s", [table.alias for table in tables])
         logger.debug("JoinPlugin.execute_multi query %s", query)
 
-        return ddbc.sql(query)
+        return query.relation(ddbc)

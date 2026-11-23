@@ -12,9 +12,21 @@ from countess.core.parameters import (
     TabularMultiParam,
 )
 from countess.core.plugins import DuckdbSqlPlugin
-from countess.utils.duckdb import duckdb_escape_identifier, duckdb_escape_literal
+from countess.utils.sql import EMPTY, Fn, Fragment, Id, Lit, Raw, Sql, join
 
 logger = logging.getLogger(__name__)
+
+
+# how each of the operations makes a test of a column {col} against a value {val}
+FILTER_TEMPLATES = {
+    "Equals": "{col} = {val}",
+    "Starts With": "starts_with({col},{val})",
+    "Ends With": "ends_with({col},{val})",
+    "Contains": "contains({col},{val})",
+    "Matches": "regexp_full_match({col},{val})",
+    "Greater Than": "({col} > {val})",
+    "Less Than": "({col} < {val})",
+}
 
 
 class ScaleClassParam(TabularMultiParam):
@@ -27,25 +39,14 @@ class ScaleClassParam(TabularMultiParam):
     )
     st = StringParam("Value")
 
-    def filter(self):
-        col = duckdb_escape_identifier(self.col.value)
-        val = duckdb_escape_literal(self.st.value)
-        if self.op.value == "Equals":
-            return f"{col} = {val}"
-        elif self.op.value == "Starts With":
-            return f"starts_with({col},{val})"
-        elif self.op.value == "Ends With":
-            return f"ends_with({col},{val})"
-        elif self.op.value == "Contains":
-            return f"contains({col},{val})"
-        elif self.op.value == "Matches":
-            return f"regexp_full_match({col},{val})"
-        elif self.op.value == "Greater Than":
-            return f"({col} > {val})"
-        elif self.op.value == "Less Than":
-            return f"({col} < {val})"
-        else:
-            raise NotImplementedError()
+    def filter(self) -> Sql:
+        try:
+            template = FILTER_TEMPLATES[self.op.value]
+        except KeyError as exc:
+            # (before looking at the column and value: whatever they are, an operation which isn't known is a
+            # mistake in the code and not something which is yet to be filled in)
+            raise NotImplementedError(self.op.value) from exc
+        return Sql.template(template, col=Id(self.col.value), val=Lit(self.st.value))
 
 
 class ScoreScalingPlugin(DuckdbSqlPlugin):
@@ -65,32 +66,47 @@ class ScoreScalingPlugin(DuckdbSqlPlugin):
         self.classifiers[0].label = "Scale to 0.0"
         self.classifiers[1].label = "Scale to 1.0"
 
-    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[str]:
-        score_col_id = duckdb_escape_identifier(self.score_col.value)
-        scaled_col_id = duckdb_escape_identifier(self.scaled_col.value)
+    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[Sql]:
+        score = Id(self.score_col.value)
+        scaled = Id(self.scaled_col.value)
 
-        all_columns = ",".join("T1." + duckdb_escape_identifier(c) for c in columns if self.scaled_col != c)
+        all_columns = join(Id.dotted("T1", c) for c in columns if self.scaled_col != c)
 
-        if self.group_col.get_values():
-            group_cols = ", ".join(duckdb_escape_identifier(v) for v in self.group_col.get_values())
-            group_by = f"GROUP BY {group_cols}"
-            join_method = f"USING ({group_cols})"
-            group_cols += ", "
+        group_cols = join(Id(v) for v in sorted(self.group_col.get_values()))
+        join_method: Fragment
+        if group_cols:
+            group_select = Sql.template("{cols}, ", cols=group_cols)
+            group_by = Sql.template("GROUP BY {cols}", cols=group_cols)
+            join_method = Sql.template("USING ({cols})", cols=group_cols)
         else:
-            group_cols = ""
-            group_by = ""
-            join_method = "ON (1=1)"
+            group_select = EMPTY
+            group_by = EMPTY
+            join_method = Raw("ON (1=1)")
 
         c0, c1 = self.classifiers
 
-        return f"""
-            select {all_columns},
-                ({score_col_id} - T2.score_0) / (T2.score_1 - T2.score_0) as {scaled_col_id}
-            from {table_name} T1 join (
-                select {group_cols}
-                    coalesce({c0.agg.value}({score_col_id}) filter ({c0.filter()}), 0) as score_0,
-                    coalesce({c1.agg.value}({score_col_id}) filter ({c1.filter()}), 1) as score_1
-                FROM {table_name}
+        # score_0 and score_1 are where the scores of the two classes are (and without any members of a class
+        # they're 0 and 1), as T2 has for each group, and the scores are scaled so those are 0 and 1.
+        return Sql.template(
+            """
+            SELECT {all_columns}, ({score} - T2.score_0) / (T2.score_1 - T2.score_0) AS {scaled}
+            FROM {table} T1 JOIN (
+                SELECT {group_select}
+                    coalesce({agg0}({score}) FILTER ({filter0}), 0) AS score_0,
+                    coalesce({agg1}({score}) FILTER ({filter1}), 1) AS score_1
+                FROM {table}
                 {group_by}
             ) T2 {join_method}
-        """
+            """,
+            all_columns=all_columns,
+            score=score,
+            scaled=scaled,
+            table=Id(table_name),
+            group_select=group_select,
+            agg0=Fn(c0.agg.value),
+            filter0=c0.filter(),
+            agg1=Fn(c1.agg.value),
+            filter1=c1.filter(),
+            group_by=group_by,
+            join_method=join_method,
+        )

@@ -1,7 +1,9 @@
 import duckdb
 import pandas as pd
+import pytest
 
 from countess.plugins.regex import RegexToolPlugin
+from countess.utils.sql import SqlError
 
 ddbc = duckdb.connect()
 
@@ -115,3 +117,40 @@ def test_no_outputs_gives_the_table_back_with_or_without_the_column():
     assert plugin.execute(ddbc, source).columns == ["txt", "n"]  # (no output columns to extract into)
     plugin.set_parameter("drop_column", True)
     assert plugin.execute(ddbc, source).columns == ["n"]
+
+
+def test_a_tool_which_has_not_been_set_up_yet_passes_everything_on():
+    """A tool which has just been added has no column, no regex and no outputs, and until it has, it
+    shouldn't be an error: the data goes through it as it is."""
+    plugin = RegexToolPlugin()
+    plugin.prepare(ddbc, source)
+    plugin.set_parameter("column", "")
+
+    out = plugin.execute(ddbc, source)
+
+    assert out.columns == ["stuff"]
+    assert out.fetchall() == [("hello",), ("backwards",), ("noaardvark",)]
+
+
+def test_a_tool_with_outputs_but_no_column_yet_is_an_error_which_says_so():
+    plugin = RegexToolPlugin()
+    plugin.set_parameter("regex", ".*?([a]+).*")
+    plugin.set_parameter("output.0.name", "foo")
+    plugin.prepare(ddbc, source)
+    plugin.set_parameter("column", "")
+
+    with pytest.raises(SqlError, match="nothing in it"):
+        plugin.execute(ddbc, source)
+
+
+def test_dropping_the_column_with_no_outputs_still_needs_no_regex():
+    plugin = RegexToolPlugin()
+    ddbc.sql("create or replace table n_two as select 'x' as stuff, 'y' as other")
+    two = ddbc.table("n_two")
+    plugin.prepare(ddbc, two)
+    plugin.set_parameter("column", "stuff")
+    plugin.set_parameter("drop_column", True)
+
+    out = plugin.execute(ddbc, two)
+
+    assert out.columns == ["other"]

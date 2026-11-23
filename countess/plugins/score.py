@@ -9,12 +9,8 @@ from duckdb.sqltypes import DuckDBPyType
 from countess import VERSION
 from countess.core.parameters import BooleanParam, ColumnGroupChoiceParam, ColumnOrNoneChoiceParam, StringParam
 from countess.core.plugins import DuckdbSimplePlugin
-from countess.utils.duckdb import (
-    duckdb_dtype_is_boolean,
-    duckdb_dtype_is_numeric,
-    duckdb_escape_identifier,
-    duckdb_escape_literal,
-)
+from countess.utils.duckdb import duckdb_dtype_is_boolean, duckdb_dtype_is_numeric
+from countess.utils.sql import EMPTY, Fn, Fragment, Id, Lit, Raw, Sql, join
 
 logger = logging.getLogger(__name__)
 
@@ -125,9 +121,9 @@ class ScoringPlugin(DuckdbSimplePlugin):
         suffix_set = {k.removeprefix(yaxis_prefix) for k in source.columns if k.startswith(yaxis_prefix)}
         suffixes = sorted(suffix_set)
 
-        count_cols = [duckdb_escape_identifier(yaxis_prefix + suffix) for suffix in suffixes]
+        count_names = [yaxis_prefix + suffix for suffix in suffixes]
 
-        logger.debug("ScoringPlugin.execute count_cols %s", count_cols)
+        logger.debug("ScoringPlugin.execute count_names %s", count_names)
 
         try:
             x_values = [float(x) for x in suffixes]
@@ -135,58 +131,66 @@ class ScoringPlugin(DuckdbSimplePlugin):
             x_values = list(range(0, len(suffixes)))
         x_max = max(x_values)
 
-        x_cols = [duckdb_escape_literal(x / x_max) for n, x in enumerate(x_values)]
+        x_cols = [Lit(x / x_max) for x in x_values]
 
         logger.debug("ScoringPlugin.execute x_cols %s", x_cols)
 
-        where_clause = ""
+        # the counts are compared with those of the whole population, or only of those which are wildtype
+        where_clause: Fragment = EMPTY
         if self.wildtype.is_not_none():
-            wtcol = duckdb_escape_identifier(self.wildtype.value)
+            wtcol = Id(self.wildtype.value)
             for col, dtype in zip(source.columns, source.dtypes):
                 if col == self.wildtype.value:
                     if duckdb_dtype_is_boolean(dtype) or duckdb_dtype_is_numeric(dtype):
-                        where_clause = f"WHERE {wtcol}"
+                        where_clause = Sql.template("WHERE {column}", column=wtcol)
                     else:
-                        where_clause = f"WHERE {wtcol} IN ('W', 'p.=', 'g.=')"
+                        where_clause = Sql.template("WHERE {column} IN ('W', 'p.=', 'g.=')", column=wtcol)
 
+        keep_fields: Fragment
         if self.drop_input:
-            keep_fields = ",".join(
-                [
-                    f"A.{duckdb_escape_identifier(f)}"
-                    for f in source.columns
-                    if duckdb_escape_identifier(f) not in count_cols
-                ]
-            )
+            keep_fields = join(Id.dotted("A", f) for f in source.columns if f not in count_names)
         else:
-            keep_fields = "A.*"
+            keep_fields = Raw("A.*")
 
+        # with replicates each is compared with the population of its own replicate
+        join_op: Fragment
+        repl_select: Fragment
+        group_clause: Fragment
+        join_using: Fragment
         if self.replicate.is_none():
-            join_op = "CROSS JOIN"
-            repl_id = ""
-            group_clause = ""
-            join_using = ""
+            join_op, repl_select, group_clause, join_using = Raw("CROSS JOIN"), EMPTY, EMPTY, EMPTY
         else:
-            join_op = "JOIN"
-            repl_id = duckdb_escape_identifier(self.replicate.value)
-            group_clause = f"GROUP BY {repl_id}"
-            join_using = f"USING ({repl_id})"
+            repl = Id(self.replicate.value)
+            join_op = Raw("JOIN")
+            repl_select = Sql.template("{repl}, ", repl=repl)
+            group_clause = Sql.template("GROUP BY {repl}", repl=repl)
+            join_using = Sql.template("USING ({repl})", repl=repl)
 
-        query = f"""
-            SELECT * EXCLUDE _SCORE,
-                _SCORE[1] AS {duckdb_escape_identifier(self.output.value)},
-                _SCORE[2] AS {duckdb_escape_identifier(self.stddev.value)}
+        query = Sql.template(
+            """
+            SELECT * EXCLUDE _SCORE, _SCORE[1] AS {output}, _SCORE[2] AS {stddev}
             FROM (
-                SELECT {keep_fields}, {self.function_name}(
-                    [{', '.join(x_cols)}],
-                    [{', '.join("A." + c for c in count_cols)}],
-                    [{', '.join("B." + c for c in count_cols)}]
-                ) AS _SCORE FROM {source.alias} AS A {join_op} (
-                    SELECT {repl_id + ", " if repl_id else ""}
-                    {', '.join(f"SUM({c}) AS {c}" for c in count_cols)}
-                    FROM {source.alias} {where_clause} {group_clause}
+                SELECT {keep_fields}, {function}([{x_cols}], [{a_counts}], [{b_counts}]) AS _SCORE
+                FROM {source} AS A {join_op} (
+                    SELECT {repl_select}{sums} FROM {source} {where_clause} {group_clause}
                 ) AS B {join_using}
             )
-        """
+            """,
+            output=Id(self.output.value),
+            stddev=Id(self.stddev.value),
+            keep_fields=keep_fields,
+            function=Fn(self.function_name),
+            x_cols=join(x_cols),
+            a_counts=join(Id.dotted("A", name) for name in count_names),
+            b_counts=join(Id.dotted("B", name) for name in count_names),
+            source=Id(source.alias),
+            join_op=join_op,
+            repl_select=repl_select,
+            sums=join(Sql.template("SUM({count}) AS {count}", count=Id(name)) for name in count_names),
+            where_clause=where_clause,
+            group_clause=group_clause,
+            join_using=join_using,
+        )
 
         logger.debug("ScoringPlugin.execute query %s", query)
-        return ddbc.sql(query)
+        return query.relation(ddbc)

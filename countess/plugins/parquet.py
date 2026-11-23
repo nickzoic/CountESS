@@ -16,8 +16,8 @@ from countess.core.parameters import (
     TabularMultiParam,
 )
 from countess.core.plugins import DuckdbLoadFileWithTheLotPlugin, DuckdbSaveFilePlugin
-from countess.utils.duckdb import duckdb_escape_identifier
 from countess.utils.files import atomic_output
+from countess.utils.sql import Fragment, Id, Sql, Type, join
 
 PARQUET_FILE_TYPES: Sequence[Tuple[str, Union[str, List[str]]]] = [
     ("Parquet", [".parquet", ".pq"]),
@@ -66,20 +66,26 @@ def parquet_compatible(source: DuckDBPyRelation) -> DuckDBPyRelation:
     """Convert any columns which Parquet can't store (see HUGE_INTEGER_TYPES) to the
     nearest thing which it can.  A value which doesn't fit is an error: better to
     stop than to write something which isn't what was asked for."""
-    projection = []
+    projection: list[Fragment] = []
     converted = []
     for column, dtype in zip(source.columns, source.dtypes):
-        identifier = duckdb_escape_identifier(column)
+        identifier = Id(column)
         if dtype.id in HUGE_INTEGER_TYPES:
             converted.append(column)
-            projection.append(f"CAST({identifier} AS {HUGE_INTEGER_TYPES[dtype.id]}) AS {identifier}")
+            projection.append(
+                Sql.template(
+                    "CAST({column} AS {type}) AS {column}",
+                    column=identifier,
+                    type=Type(HUGE_INTEGER_TYPES[dtype.id]),
+                )
+            )
         else:
             projection.append(identifier)
 
     if not converted:
         return source
     logger.info("Parquet can't store 128 bit integers, so %s will be saved as 64 bit", ", ".join(converted))
-    return source.project(", ".join(projection))
+    return source.project(str(join(projection)))
 
 
 class SaveParquetPlugin(DuckdbSaveFilePlugin):
@@ -108,11 +114,12 @@ class SaveParquetPlugin(DuckdbSaveFilePlugin):
         source = parquet_compatible(source)
 
         if len(self.sorting):
-            order_by = ",".join(
-                duckdb_escape_identifier(sp.order_by.value) + (" desc" if sp.descending else "") for sp in self.sorting
+            order_by = join(
+                Sql.template("{column} DESC", column=Id(sp.order_by.value)) if sp.descending else Id(sp.order_by.value)
+                for sp in self.sorting
             )
             logger.debug("SaveParquetPlugin.execute order_by %s", order_by)
-            source = source.order(order_by)
+            source = source.order(str(order_by))
 
         filename = self.filename.get_file_path()
         Path(filename).parent.mkdir(parents=True, exist_ok=True)

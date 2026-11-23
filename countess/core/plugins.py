@@ -34,7 +34,8 @@ from countess.core.parameters import (
     HasSubParametersMixin,
     MultiParam,
 )
-from countess.utils.duckdb import duckdb_combine, duckdb_dtype_is_numeric, duckdb_escape_literal, duckdb_source_to_view
+from countess.utils.duckdb import duckdb_combine, duckdb_dtype_is_numeric, duckdb_source_to_view
+from countess.utils.sql import Fn, Fragment, Id, Lit, Raw, Sql, SqlError
 
 PRERUN_ROW_LIMIT: int = 100000
 
@@ -176,16 +177,24 @@ class DuckdbSqlPlugin(DuckdbSimplePlugin):
     def execute(
         self, ddbc: DuckDBPyConnection, source: DuckDBPyRelation, row_limit: Optional[int] = None
     ) -> Optional[DuckDBPyRelation]:
-        sql = self.sql(source.alias, source.columns)
+        try:
+            sql = self.sql(source.alias, source.columns)
+        except SqlError as exc:
+            # something it needs, a column say, hasn't been chosen yet or can't be used: so it can't do anything
+            # (yet).  It's the same as it was before there were SqlErrors, when it was left to DuckDB to say so.
+            logger.warning("%s isn't set up: %s", self.__class__.__name__, exc)
+            return None
         logger.debug(f"{self.__class__}.execute sql %s", sql)
         if sql:
             try:
-                return ddbc.sql(sql)
+                return ddbc.sql(str(sql))
             except duckdb.ProgrammingError as exc:
                 logger.warning(exc)
         return None
 
-    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[str]:
+    def sql(self, table_name: str, columns: Iterable[str]) -> Optional[Union[str, Fragment]]:
+        """The SQL, as text or built with countess.utils.sql, which does all of the plugin's work.  An SqlError
+        means that it isn't set up properly yet."""
         raise NotImplementedError(f"{self.__class__}.sql")
 
 
@@ -299,9 +308,9 @@ class LoadFileWithFilenameMixin:
             except ValueError:
                 # relpath can fail on windows
                 filename_value = filename
-            proj = f"*, {duckdb_escape_literal(filename_value)} as filename"
+            proj = Sql.template("*, {filename} AS filename", filename=Lit(filename_value))
             logger.debug("LoadFileWithFilenameMixin load_file_wrapper proj %s", proj)
-            return rel.project(proj)
+            return rel.project(str(proj))
         else:
             return rel
 
@@ -366,12 +375,16 @@ class DuckdbTransformPlugin(DuckdbSimplePlugin):
         )
 
         subquery = self.subquery(source.alias, source.columns)
-        sql = f"SELECT UNNEST({function_name}(_ROW)) FROM ({subquery}) AS _ROW"
-        logger.debug(sql)
-        return ddbc.sql(sql)
+        sql = Sql.template(
+            "SELECT UNNEST({function}({row})) FROM ({subquery}) AS {row}",
+            function=Fn(function_name),
+            row=Raw("_ROW"),
+            subquery=subquery if isinstance(subquery, Fragment) else Raw(subquery),
+        )
+        return sql.relation(ddbc)
 
-    def subquery(self, table_name: str, columns: list[str]) -> str:
-        return f"SELECT * FROM {table_name}"
+    def subquery(self, table_name: str, columns: list[str]) -> Union[str, Fragment]:
+        return Sql.template("SELECT * FROM {table}", table=Id(table_name))
 
     def transform(self, data: dict[str, Any]) -> Optional[Dict[str, Any]]:
         """This will be called for each row. Return a tuple with the same
