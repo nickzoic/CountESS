@@ -480,3 +480,9 @@ Score Columns
 
 Stddev Columns
 : Columns containing corresponding standard deviations
+
+Scores can be in columns of any numeric type, including decimals, and are combined as floating point numbers.
+
+If a score or a standard deviation is missing (NULL), or the scores can't be combined for some other reason (a standard deviation which isn't more than zero, or no scores at all) then the combined score and standard deviation are NULL.  The rest of the row is kept as it is, and the other rows are not affected.
+
+The Random Effects (Group) plugin combines the scores in each group of rows in the same way, and counts the rows in each group.  A group with a missing score or standard deviation is still there, with a NULL score and standard deviation and its count of rows.

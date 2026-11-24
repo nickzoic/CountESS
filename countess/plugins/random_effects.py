@@ -72,9 +72,21 @@ def rml_estimate(
 
 
 def rml_estimate_wrapper(scores: list[float], sigmas: list[float]) -> tuple[float | None, float | None]:
+    """`rml_estimate`, but for anything which it can't be done for the answer is NULLs (None, None) and not an error,
+    which in a query would be the end of the whole query and not just of one row or group:
+
+    * a NULL (None) anywhere in the scores or sigmas, or nothing to combine: a score which isn't known can't be
+      combined with the others, so there's no score;
+    * what `rml_estimate` itself refuses, such as a sigma which isn't more than 0 or a different number of scores
+      from sigmas, or does the arithmetic of badly (a sigma so small that its square is 0).
+
+    The scores and sigmas are made into floats, as they'd otherwise arrive as Decimals from a DECIMAL column,
+    which can't be multiplied by a float, which is a lot of what's done with them."""
+    if not scores or not sigmas or any(v is None for v in scores) or any(v is None for v in sigmas):
+        return None, None
     try:
-        return rml_estimate(scores, sigmas)
-    except (RuntimeError, AssertionError) as exc:
+        return rml_estimate([float(v) for v in scores], [float(v) for v in sigmas])
+    except (RuntimeError, AssertionError, ArithmeticError) as exc:
         logger.info(exc)
         return None, None
 
@@ -105,13 +117,9 @@ class RandomEffectsPlugin(DuckdbParallelTransformPlugin):
         scores = [v for k, v in sorted(data.items()) if k.startswith(self.score_cols.get_column_prefix())]
         sigmas = [v for k, v in sorted(data.items()) if k.startswith(self.sigma_cols.get_column_prefix())]
 
-        if not scores or None in scores or not sigmas or None in sigmas:
-            return None
-
-        if any(sigma == 0 for sigma in sigmas):
-            return None
-
-        score, sigma = rml_estimate(scores, sigmas)
+        # A row which can't be combined (a score is NULL, say) is kept, with NULL for its score and sigma, as
+        # in a group.  (Returning None would make the whole row NULL, the id and the rest of it as well.)
+        score, sigma = rml_estimate_wrapper(scores, sigmas)
 
         if self.drop_cols:
             for c in self.score_cols.get_matching_columns():

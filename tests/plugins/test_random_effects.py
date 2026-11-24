@@ -134,6 +134,50 @@ def test_the_wrapper_gives_nulls_for_bad_input_instead_of_raising():
     assert rml_estimate_wrapper([1.0, 3.0], [0.1, 0.1]) == pytest.approx(rml_estimate([1.0, 3.0], [0.1, 0.1]))
 
 
+@pytest.mark.parametrize(
+    "scores,sigmas",
+    [
+        ([1.0, None], [0.1, 0.2]),
+        ([None, None], [0.1, 0.2]),
+        ([1.0, 2.0], [0.1, None]),
+        ([None], [None]),
+        ([], []),
+        ([1.0, 2.0], []),
+        ([], [0.1, 0.2]),
+        (None, None),  # (what LIST() of no rows at all is)
+        ([1.0, 2.0], [0.1, -0.2]),
+        ([1.0, 2.0], [0.1, 1e-200]),  # (so small that its square is 0, which divides by 0)
+    ],
+    ids=[
+        "null score",
+        "null scores",
+        "null sigma",
+        "only nulls",
+        "no scores",
+        "no sigmas",
+        "no scores for sigmas",
+        "no lists",
+        "negative sigma",
+        "tiny sigma",
+    ],
+)
+def test_what_cant_be_combined_is_nulls_and_not_an_error(scores, sigmas):
+    """(A NULL score can't be combined with the others, so there is no score; it's not for it to be left out, or
+    to stop whatever else is being done as well.)"""
+    assert rml_estimate_wrapper(scores, sigmas) == (None, None)
+
+
+def test_the_wrapper_takes_decimals_as_the_floats_they_are_worth():
+    from decimal import Decimal  # pylint: disable=import-outside-toplevel
+
+    decimals = rml_estimate_wrapper([Decimal("0.5"), Decimal("1.5")], [Decimal("0.1"), Decimal("0.2")])
+    assert decimals == pytest.approx(rml_estimate([0.5, 1.5], [0.1, 0.2]))
+    assert all(isinstance(v, float) for v in decimals)
+    assert rml_estimate_wrapper([Decimal("1"), 2.0, 3], [Decimal("0.1"), 0.2, 1]) == pytest.approx(
+        rml_estimate([1.0, 2.0, 3.0], [0.1, 0.2, 1.0])
+    )
+
+
 # ---- combining the scores in each row
 
 
@@ -190,17 +234,26 @@ def test_inputs_can_be_dropped(ddbc, row_source):
         {"score_2": None},
         {"sigma_2": None},
         {"sigma_2": 0},
+        {"sigma_2": -0.2},
+        {"score_1": None, "score_2": None, "score_3": None},
     ],
-    ids=["missing score", "missing sigma", "zero sigma"],
+    ids=["missing score", "missing sigma", "zero sigma", "negative sigma", "no scores"],
 )
-def test_a_row_which_cant_be_combined_gives_nothing(ddbc, row_source, change):
+def test_a_row_which_cant_be_combined_is_kept_with_nulls_for_its_score(ddbc, row_source, change):
     plugin = row_plugin(ddbc, row_source)
-    assert plugin.transform({**ROW, **change}) is None
+    row = {**ROW, **change}
+    output = plugin.transform(dict(row))
+    assert output == {**row, "score": None, "sigma": None}  # (so its id, and all of the rest of it, are still there)
 
 
-def test_without_any_scores_there_is_nothing_to_combine(ddbc, row_source):
+def test_a_row_which_cant_be_combined_has_its_inputs_dropped_too_if_it_is_to_be(ddbc, row_source):
+    plugin = row_plugin(ddbc, row_source, drop=True)
+    assert plugin.transform({**ROW, "score_2": None}) == {"id": "v", "score": None, "sigma": None}
+
+
+def test_without_any_scores_there_is_nothing_to_combine_but_the_row_is_kept(ddbc, row_source):
     plugin = row_plugin(ddbc, row_source)
-    assert plugin.transform({"id": "v"}) is None
+    assert plugin.transform({"id": "v"}) == {"id": "v", "score": None, "sigma": None}
 
 
 def test_row_plugin_in_a_query(ddbc, make_source):
@@ -220,12 +273,36 @@ def test_row_plugin_drops_inputs_in_a_query(ddbc, make_source):
     assert output.columns == ["id", "score", "sigma"]
 
 
-def test_a_row_which_cant_be_combined_is_a_row_of_nulls_in_a_query(ddbc, make_source):
-    """(Documented in DuckdbTransformPlugin.transform: None means all NULLs, which includes the id.)"""
-    source = make_source(DOUBLES.format("('a', 0.5, 1.5, 0.1, 0.2), ('b', 2.0, 2.0, 0.0, 0.3)"))
+def test_a_row_which_cant_be_combined_is_still_a_row_in_a_query(ddbc, make_source):
+    """A NULL score gives a NULL score: the row still has its id and everything else, and the other rows are as
+    they were.  (It used to be a row of nothing but NULLs, the id as well, as DuckdbTransformPlugin.transform says
+    that None is.)"""
+    source = make_source(
+        DOUBLES.format("('a', 0.5, 1.5, 0.1, 0.2), ('b', 2.0, NULL, 0.1, 0.3), ('c', 2.0, 2.0, 0.0, 0.3)")
+    )
+    rows = {r[0]: r for r in row_plugin(ddbc, source).execute(ddbc, source).fetchall()}
+    assert sorted(rows) == ["a", "b", "c"]  # (all three, none of them lost)
+    assert (rows["a"][5], rows["a"][6]) == pytest.approx(rml_estimate([0.5, 1.5], [0.1, 0.2]))
+    assert rows["b"] == ("b", 2.0, None, 0.1, 0.3, None, None)
+    assert rows["c"] == ("c", 2.0, 2.0, 0.0, 0.3, None, None)
+
+
+def test_a_missing_score_doesnt_stop_the_rows_after_it(ddbc, make_source):
+    values = ", ".join(f"('r{n}', {n}.5, {'NULL' if n % 3 == 0 else f'{n + 1}.5'}, 0.1, 0.2)" for n in range(30))
+    source = make_source(DOUBLES.format(values))
     rows = row_plugin(ddbc, source).execute(ddbc, source).fetchall()
-    assert len(rows) == 2
-    assert (None,) * 7 in rows
+    assert len(rows) == 30
+    assert sum(1 for r in rows if r[5] is None) == 10 and sum(1 for r in rows if r[5] is not None) == 20
+
+
+def test_decimal_columns_with_missing_scores_in_a_query(ddbc, make_source):
+    source = make_source(
+        "select * from (values ('a', 0.5, 1.5, 0.1, 0.2), ('b', 0.5, NULL, 0.1, 0.2)) t(id, score_1, score_2, sigma_1, sigma_2)"
+    )
+    assert str(source.dtypes[1]).startswith("DECIMAL")
+    rows = {r[0]: r for r in row_plugin(ddbc, source).execute(ddbc, source).fetchall()}
+    assert rows["a"][5:] == pytest.approx(rml_estimate([0.5, 1.5], [0.1, 0.2]))
+    assert rows["b"][0] == "b" and rows["b"][5:] == (None, None)
 
 
 # ---- combining the scores in groups
@@ -309,13 +386,6 @@ def test_odd_column_names(ddbc, make_source, assert_rows):
     assert_rows(plugin.execute(ddbc, source), [("x", *rml_estimate([1.0, 2.0], [0.1, 0.2]), 2)])
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=duckdb.InvalidInputException,
-    reason="one NULL score anywhere in the table makes rml_estimate raise a TypeError, which "
-    "rml_estimate_wrapper doesn't catch (only RuntimeError and AssertionError) so the whole query fails, "
-    "instead of just the group which has the NULL being given NULLs like any other group which can't be combined",
-)
 def test_a_group_with_a_missing_score_doesnt_stop_the_others(ddbc, make_source, assert_rows):
     source = make_source(
         "select * from (values ('a', 1.0, 0.1), ('a', 2.0, 0.2), ('b', 3.0, 0.1), ('b', NULL, 0.1)) t(grp, score, sigma)"
@@ -323,14 +393,35 @@ def test_a_group_with_a_missing_score_doesnt_stop_the_others(ddbc, make_source, 
     output = group_plugin(ddbc, source).execute(ddbc, source)
     rows = {r[0]: r for r in output.fetchall()}
     assert rows["a"][1:3] == pytest.approx(rml_estimate([1.0, 2.0], [0.1, 0.2]))
+    # (the group with the NULL is there, with NULLs for its score and sigma, and it still counts its rows)
+    assert rows["b"] == ("b", None, None, 2)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=duckdb.InvalidInputException,
-    reason="DECIMAL columns are offered as numeric ones, but a DECIMAL arrives in transform() as a Python Decimal, "
-    "and rml_estimate fails with 'unsupported operand type(s) for ** or pow(): Decimal and float'",
-)
+def test_a_group_with_a_missing_sigma_is_the_same(ddbc, make_source, assert_rows):
+    source = make_source(
+        "select * from (values ('a', 1.0, 0.1), ('a', 2.0, NULL), ('b', 3.0, 0.1)) t(grp, score, sigma)"
+    )
+    assert_rows(group_plugin(ddbc, source).execute(ddbc, source), [("a", None, None, 2), ("b", 3.0, 0.1, 1)])
+
+
+def test_all_the_scores_with_a_missing_one_are_a_row_of_nulls_which_counts(ddbc, make_source, assert_rows):
+    source = make_source(
+        "select * from (values ('a', 1.0, 0.1), ('b', NULL, 0.2), ('c', 3.0, 0.3)) t(grp, score, sigma)"
+    )
+    assert_rows(group_plugin(ddbc, source, group=False).execute(ddbc, source), [(None, None, 3)])
+
+
+def test_decimal_columns_are_combined_in_groups_too(ddbc, make_source, assert_rows):
+    source = make_source(
+        "select * from (values ('a', 1.0, 0.1), ('a', 2.0, 0.2), ('b', 3.0, NULL)) t(grp, score, sigma)"
+    )
+    assert str(source.dtypes[1]).startswith("DECIMAL")
+    assert_rows(
+        group_plugin(ddbc, source).execute(ddbc, source),
+        [("a", *rml_estimate([1.0, 2.0], [0.1, 0.2]), 2), ("b", None, None, 1)],
+    )
+
+
 def test_decimal_columns_can_be_combined_too(ddbc, make_source):
     source = make_source("select 'a' as id, 0.5 as score_1, 1.5 as score_2, 0.1 as sigma_1, 0.2 as sigma_2")
     assert str(source.dtypes[1]).startswith("DECIMAL")
